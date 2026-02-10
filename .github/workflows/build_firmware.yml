@@ -26,8 +26,8 @@ jobs:
 
     - name: Install ESP-IDF Python dependencies
       run: |
-        pip install -r $IDF_PATH/requirements.txt
-        pip install -r $IDF_PATH/tools/kconf_gen/requirements.txt # For kconf_gen if used
+        python -m pip install -r $IDF_PATH/requirements.txt
+        python -m pip install -r $IDF_PATH/tools/kconf_gen/requirements.txt # For kconf_gen if used
 
     - name: Build ESP-IDF project
       working-directory: ./firmware # Change working directory to your firmware project
