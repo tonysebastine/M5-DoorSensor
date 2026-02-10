@@ -22,6 +22,17 @@ jobs:
     - name: Build ESP-IDF project
       working-directory: ./firmware # Change working directory to your firmware project
       run: |
+        # Source the ESP-IDF export script to ensure idf.py is in PATH
+        # This path might vary depending on the container image.
+        # Common locations are /opt/esp/idf/export.sh or /esp/idf/export.sh
+        if [ -f /opt/esp/idf/export.sh ]; then
+          . /opt/esp/idf/export.sh
+        elif [ -f /esp/idf/export.sh ]; then
+          . /esp/idf/export.sh
+        else
+          echo "Warning: ESP-IDF export.sh not found in common locations. idf.py might not be in PATH."
+        fi
+        
         idf.py build \
           -DCONFIG_WIFI_SSID="${{ secrets.WIFI_SSID }}" \
           -DCONFIG_WIFI_PASSWORD="${{ secrets.WIFI_PASSWORD }}" \
