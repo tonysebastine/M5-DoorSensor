@@ -1,3 +1,4 @@
 dependencies:
   espp/bmi270: ">=1.0.0" # Use a version range or specific version as appropriate
   idf: "*"
+  espressif/mqtt: "^1.0.0" # Placeholder version, will default to latest compatible
