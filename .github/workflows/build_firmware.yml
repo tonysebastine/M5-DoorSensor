@@ -19,11 +19,6 @@ jobs:
       with:
         submodules: recursive # Needed if you have ESP-IDF components as submodules
 
-    - name: Set up Python environment
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
-
     - name: Build ESP-IDF project
       working-directory: ./firmware # Change working directory to your firmware project
       run: |
