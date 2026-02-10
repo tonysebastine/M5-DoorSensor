@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf-build:latest # Use a pre-built ESP-IDF container
+    container: espressif/idf:latest # Use the correct pre-built ESP-IDF container
 
     steps:
     - name: Checkout repository
