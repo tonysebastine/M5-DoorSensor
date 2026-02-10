@@ -31,9 +31,30 @@ static const char *TAG = "DOORSENSOR";
 // Static IP and Wi-Fi credentials will eventually come from CMake/Kconfig.
 
 // ------------------------- Agent A: Hardware Abstraction -------------------------
-// GPIO setup. Note: `gpio_num_t` is from ESP-IDF.
-#define REED_PIN GPIO_NUM_26
-#define DOOR_CLOSED_LEVEL 0 // LOW
+// No external reed switch used. Door state detected via inbuilt IMU.
+#include <driver/i2c.h>
+#include "bmi270.h"
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+
+#define I2C_MASTER_SDA_IO           GPIO_NUM_21
+#define I2C_MASTER_SCL_IO           GPIO_NUM_22
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ          400000
+#define I2C_MASTER_TX_BUF_DISABLE   0
+#define I2C_MASTER_RX_BUF_DISABLE   0
+
+static bmi270_t bmi270_dev;
+
+// ADC definitions for battery voltage reading (M5StickC Plus2 uses GPIO38)
+#define BATTERY_ADC_UNIT            ADC_UNIT_1
+#define BATTERY_ADC_CHANNEL         ADC_CHANNEL_2    // GPIO38 is ADC1_CHANNEL_2
+#define BATTERY_ADC_ATTEN           ADC_ATTEN_DB_11  // 11dB attenuation for a wider voltage range
+#define BATTERY_ADC_WIDTH           ADC_WIDTH_BIT_12 // 12-bit resolution
+#define BATTERY_VOLTAGE_DIVIDER_FACTOR 2.0
+#define BATTERY_ADC_SAMPLE_COUNT    64 // Number of samples to average
+
+static esp_adc_cal_characteristics_t adc_chars;
 
 // --------------------------- Agent B: Power Manager ------------------------------
 // CPU_FREQ_MHZ is usually set in sdkconfig, but 80MHz is a common default for low power.
@@ -159,39 +180,126 @@ const char* eventToText(const RuntimeContext& ctx) {
   return "NO_EVENT";
 }
 
-bool readDoorClosedDebounced() {
-  uint8_t lowCount = 0;
-  uint8_t highCount = 0;
-
-  for (uint8_t i = 0; i < DEBOUNCE_SAMPLES; ++i) {
-    int v = gpio_get_level(REED_PIN); // Replace digitalRead with gpio_get_level
-    if (v == 0) { // LOW
-      lowCount++;
-    } else { // HIGH
-      highCount++;
+// Function to initialize I2C and BMI270 sensor
+esp_err_t initIMU() {
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = I2C_MASTER_SDA_IO;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_io_num = I2C_MASTER_SCL_IO;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
+    conf.clk_flags = I2C_SCLK_SRC_FLAG_FOR_NOMAL; // Use default clock source
+    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C parameter configuration failed: %s", esp_err_to_name(err));
+        return err;
     }
-    vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_GAP_MS)); // Replace delay with vTaskDelay
+    err = i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C driver installation failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Initialize BMI270
+    bmi270_dev.i2c_addr = BMI270_I2C_ADDR_LOW; // Or BMI270_I2C_ADDR_HIGH depending on configuration
+    bmi270_dev.i2c_port = I2C_MASTER_NUM;
+    err = bmi270_init(&bmi270_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "BMI270 initialization failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "BMI270 initialized successfully.");
+    return ESP_OK;
+}
+
+// Function to initialize ADC for battery voltage reading
+esp_err_t initADC() {
+    ESP_ERROR_CHECK(adc1_config_width(BATTERY_ADC_WIDTH));
+    ESP_ERROR_CHECK(adc1_config_channel_atten(BATTERY_ADC_CHANNEL, BATTERY_ADC_ATTEN));
+
+    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(BATTERY_ADC_UNIT, BATTERY_ADC_ATTEN, BATTERY_ADC_WIDTH, 1100, &adc_chars);
+    if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+        ESP_LOGI(TAG, "ADC calibration: eFuse Vref in use");
+    } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
+        ESP_LOGI(TAG, "ADC calibration: eFuse Two Point in use");
+    } else {
+        ESP_LOGI(TAG, "ADC calibration: Default Vref in use");
+    }
+    ESP_LOGI(TAG, "ADC for battery voltage initialized successfully.");
+    return ESP_OK;
+}
+
+bool readDoorClosedDebounced() {
+  float sum_z_accel = 0;
+  for (uint8_t i = 0; i < DEBOUNCE_SAMPLES; ++i) {
+    bmi270_sensor_data_t accel;
+    esp_err_t err = bmi270_get_acceleration(&bmi270_dev, &accel);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to read BMI270 acceleration for debounce: %s", esp_err_to_name(err));
+      // In case of error, assume previous state or a safe default.
+      // For now, let's just use 0 and hope for recovery in next cycle.
+      sum_z_accel += 0;
+    } else {
+      sum_z_accel += accel.z;
+    }
+    vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_GAP_MS));
   }
 
-  int stableLevel = (lowCount >= highCount) ? 0 : 1; // 0 for LOW, 1 for HIGH
-  return stableLevel == DOOR_CLOSED_LEVEL;
+  float avg_z_accel = sum_z_accel / DEBOUNCE_SAMPLES;
+  ESP_LOGI(TAG, "Average Z-acceleration: %.2f G", avg_z_accel);
+
+  // Assuming:
+  // - When door is CLOSED, device is mostly vertical, Z-axis ~1.0 G (or -1.0 G depending on orientation)
+  // - When door is OPEN, device is horizontal, Z-axis ~0.0 G
+  // This threshold will need calibration based on actual mounting.
+  // For a door in vertical position, if Z points upwards (closed), it's +1G. If Z points downwards (closed), it's -1G.
+  // When open, it might be horizontal, so Z is ~0G.
+  // Let's assume a mounting where Z is around 1G when closed.
+  const float DOOR_CLOSED_Z_THRESHOLD_MIN = 0.8f; // Example threshold
+  const float DOOR_CLOSED_Z_THRESHOLD_MAX = 1.2f; // Example threshold
+
+  bool currently_closed = (avg_z_accel > DOOR_CLOSED_Z_THRESHOLD_MIN && avg_z_accel < DOOR_CLOSED_Z_THRESHOLD_MAX);
+
+  return currently_closed;
 }
 
 bool detectTamperMovement() {
-  // M5.Imu.getAccelData is part of M5Unified, which is Arduino-specific.
-  // This needs to be replaced with ESP-IDF I2C/SPI drivers for the IMU sensor (e.g., BMI270, MPU6886).
-  // For now, return false as a placeholder. This will require significant work.
-  ESP_LOGW(TAG, "IMU functionality (tamper detection) is not yet implemented in ESP-IDF.");
+  bmi270_sensor_data_t accel;
+  esp_err_t err = bmi270_get_acceleration(&bmi270_dev, &accel);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read BMI270 acceleration: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  // Calculate magnitude of acceleration vector
+  float accel_magnitude = sqrt(accel.x * accel.x + accel.y * accel.y + accel.z * accel.z);
+
+  // Compare with threshold. This is a simple thresholding, more complex logic might be needed.
+  if (accel_magnitude > TAMPER_G_THRESHOLD) {
+    ESP_LOGW(TAG, "Tamper detected! Accel magnitude: %.2f G (Threshold: %.2f G)", accel_magnitude, TAMPER_G_THRESHOLD);
+    return true;
+  }
   return false;
 }
 
-// Function to get battery voltage (placeholder for M5.Power.getBatteryVoltage())
+// Function to get battery voltage from ADC
 uint32_t getBatteryVoltageMv() {
-    // M5.Power.getBatteryVoltage() is part of M5Unified.
-    // This needs to be replaced with ESP-IDF ADC driver code reading the battery voltage pin.
-    // For now, return a dummy value.
-    ESP_LOGW(TAG, "Battery voltage reading is not yet implemented in ESP-IDF, returning dummy value.");
-    return 3700; // Dummy value: 3.7V
+    uint32_t adc_reading = 0;
+    // Take multiple samples for better accuracy
+    for (int i = 0; i < BATTERY_ADC_SAMPLE_COUNT; i++) {
+        adc_reading += adc1_get_raw(BATTERY_ADC_CHANNEL);
+    }
+    adc_reading /= BATTERY_ADC_SAMPLE_COUNT;
+
+    // Convert raw ADC reading to voltage in mV
+    uint32_t voltage_mv = esp_adc_cal_raw_to_voltage(adc_reading, &adc_chars);
+
+    // Apply voltage divider factor
+    voltage_mv = (uint32_t)(voltage_mv * BATTERY_VOLTAGE_DIVIDER_FACTOR);
+
+    ESP_LOGI(TAG, "Battery voltage: %d mV", voltage_mv);
+    return voltage_mv;
 }
 
 
@@ -546,24 +654,8 @@ void publishEvent(const RuntimeContext& ctx) {
 
 
 void configureDeepSleep(bool doorClosedNow) {
-  // Configure GPIO for EXT0 wakeup.
-  gpio_config_t io_conf = {};
-  io_conf.pin_bit_mask = (1ULL << REED_PIN);
-  io_conf.mode = GPIO_MODE_INPUT;
-  io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  io_conf.intr_type = GPIO_INTR_DISABLE;
-  gpio_config(&io_conf);
-
-  // EXT0 wakes on a single logic level. Configure the next wake level as the
-  // opposite of current stable door level, so both OPEN and CLOSE transitions
-  // can wake the ESP32 across cycles.
-  const int currentLevel = doorClosedNow ? DOOR_CLOSED_LEVEL : !DOOR_CLOSED_LEVEL;
-  const esp_sleep_ext1_wakeup_mode_t wake_mode = (currentLevel == 0) ? ESP_EXT1_WAKEUP_ALL_LOW : ESP_EXT1_WAKEUP_ALL_HIGH;
-  
-  // Use ext1 wakeup for now, ext0 is more limited
-  ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(1ULL << REED_PIN, wake_mode));
-
+  // Deep sleep wakeup will be handled by the timer for now.
+  // In the future, this should be replaced with BMI270 motion interrupts for more efficient wakeup.
   if (HEARTBEAT_TIMER_ENABLED) {
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(HEARTBEAT_INTERVAL_US));
   }
@@ -611,9 +703,11 @@ extern "C" void app_main() {
 
   ESP_LOGI(TAG, "M5-DoorSensor Starting (Boot Count: %d)", rtcBootCounter);
 
-  // Configure GPIO for reed switch
-  gpio_set_direction(REED_PIN, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(REED_PIN, GPIO_PULLUP_ONLY);
+  // Initialize IMU
+  ESP_ERROR_CHECK(initIMU());
+
+  // Initialize ADC for battery voltage
+  ESP_ERROR_CHECK(initADC());
 
   rtcBootCounter++;
 

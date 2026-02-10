@@ -1,17 +1,15 @@
-# M5StickC Plus2 Low-Power Door Sensor
+# M5Stack Cplus2 Low-Power Door Sensor
 
-Production-oriented firmware and deployment assets for an **M5StickC Plus2** door sensor with:
+Production-oriented firmware and deployment assets for an **M5Stack Cplus2** door sensor with:
 
-- Reed-switch door state detection (`GPIO26`)
-- IMU-based tamper detection while door is closed
+- **Inbuilt sensor-based door state detection** (e.g., accelerometer, magnetometer)
 - MQTT event publishing for PC integrations (Node-RED/Mosquitto)
 - Optional Telegram alerting (direct from device)
-- Deep-sleep-first lifecycle for battery operation
+- Deep-sleep-first lifecycle for optimal battery operation
 
 ## Repository Contents
 
-- `firmware/door_sensor.ino` — Main firmware (modularized by functional sections)
-- `firmware/secrets.example.h` — Copy-to-config template for Wi-Fi/MQTT/Telegram
+- `firmware/main/door_sensor.cpp` — Main firmware (ESP-IDF)
 - `nodered/door_sensor_flow.json` — Importable Node-RED flow for MQTT -> Telegram
 - `docs/android-app-selection.md` — Android application options and recommendations
 - `docs/test-validation-checklist.md` — Validation checklist and test procedure
@@ -22,56 +20,41 @@ Production-oriented firmware and deployment assets for an **M5StickC Plus2** doo
 
 ### Mandatory hardware
 
-- M5StickC Plus2
-- Magnetic reed switch
-- Magnet
+- M5Stack Cplus2
 
 ### Wiring
 
-- Reed switch one side -> **GPIO 26**
-- Reed switch other side -> **GND**
-- Firmware uses `INPUT_PULLUP` (active-low switch)
-
-> If your installation yields inverted semantics (OPEN/CLOSED reversed), set `DOOR_CLOSED_LEVEL` in firmware.
+- No external wiring required for door state detection, uses inbuilt sensors.
 
 ---
 
-## 2) Firmware Build/Flash (ESP32 Arduino Core)
+## 2) Firmware Build/Flash (ESP-IDF)
 
-1. Install Arduino IDE 2.x
-2. Install **ESP32 by Espressif Systems** board package (Arduino core)
-3. Install libraries:
-   - `M5Unified`
-   - `PubSubClient`
-   - `ArduinoJson`
-4. Copy `firmware/secrets.example.h` to `firmware/secrets.h`
-5. Fill in Wi-Fi + MQTT configuration in `secrets.h`
-6. Open `firmware/door_sensor.ino`
-7. Select matching board for M5StickC Plus2 and flash
+1. Ensure you have the ESP-IDF development environment set up.
+2. Navigate to the `firmware/` directory.
+3. Configure the project: `idf.py menuconfig` (set Wi-Fi, MQTT, and other configurations)
+4. Build the project: `idf.py build`
+5. Flash the firmware: `idf.py -p /dev/ttyUSB0 flash` (replace `/dev/ttyUSB0` with your serial port)
 
 ---
 
 ## 3) Runtime Behavior (Boot -> Sleep)
 
-1. Device wakes from ESP32 EXT0 (`GPIO26`) or timer
+1. Device wakes from ESP32 EXT0 or timer
 2. CPU is lowered to 80 MHz; LCD stays off
-3. Door state is sampled/debounced
-4. If state changed -> publish `OPEN`/`CLOSED`
-5. If door closed -> IMU sampled for ~240 ms for tamper detection
-6. If movement exceeds threshold and cooldown passed -> publish tamper
-7. Optional heartbeat on timer wake
-8. Wi-Fi is disconnected, then device returns to deep sleep
+3. Inbuilt sensors are sampled/debounced to determine door state
+4. If state changed -> publish `OPEN`/`CLOSED` via MQTT
+5. Optional heartbeat on timer wake
+6. Wi-Fi is disconnected, then device returns to deep sleep
 
-The firmware dynamically sets EXT0 wake level to the opposite of the current reed level, so both OPEN and CLOSED transitions can wake across sleep cycles.
-
-No blocking loop is used; all work happens in `setup()` and `loop()` is empty.
+The firmware dynamically sets EXT0 wake level (if applicable for inbuilt sensors) to minimize power consumption and ensure both OPEN and CLOSED transitions can wake across sleep cycles.
 
 ---
 
 ## 4) MQTT Topic Contract
 
 - `door/state` with event payload `OPEN` or `CLOSED`
-- `door/tamper` with event payload `FORCE_DETECTED`
+- `door/tamper` with event payload `FORCE_DETECTED` (if implemented with inbuilt IMU)
 - `door/heartbeat` (optional)
 
 Payload schema:
@@ -82,7 +65,7 @@ Payload schema:
   "event": "OPEN",
   "timestamp": "ISO8601-or-uptime-fallback",
   "battery_mv": 4012,
-  "wake_reason": "EXT0"
+  "wake_reason": "EXT0" // Or other wake reason
 }
 ```
 
@@ -118,7 +101,7 @@ For best battery life:
 
 - Keep RSSI strong (reduces connect time)
 - Avoid very frequent heartbeat
-- Keep tamper threshold tuned to your mount vibration profile
+- Tune sensor sampling and thresholds for optimal detection and power usage
 
 ---
 
@@ -126,7 +109,6 @@ For best battery life:
 
 Use `docs/test-validation-checklist.md` for end-to-end verification:
 
-- Door state reliability
-- False positive tamper screening
+- Door state reliability using inbuilt sensors
 - Deep sleep current / wake duty cycle
 - End-to-end notification latency
