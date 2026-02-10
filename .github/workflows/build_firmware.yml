@@ -1,4 +1,4 @@
-name: Firmware Build
+name: ESP-IDF Firmware Build
 
 on:
   push:
@@ -11,70 +11,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: espressif/idf-build:latest # Use a pre-built ESP-IDF container
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        submodules: recursive # Needed if you have ESP-IDF components as submodules
 
-    - name: Install Arduino CLI
+    - name: Set up Python environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install ESP-IDF Python dependencies
       run: |
-        curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-        sudo mv bin/arduino-cli /usr/local/bin/arduino-cli
-        arduino-cli version
+        pip install -r $IDF_PATH/requirements.txt
+        pip install -r $IDF_PATH/tools/kconf_gen/requirements.txt # For kconf_gen if used
 
-    - name: Configure Arduino CLI for ESP32 and M5Stack
+    - name: Build ESP-IDF project
+      working-directory: ./firmware # Change working directory to your firmware project
       run: |
-        arduino-cli config init
-        arduino-cli config set board_manager.additional_urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json,https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json"
-        arduino-cli core update-index
-
-    - name: Install ESP32 core
-      run: arduino-cli core install esp32:esp32
-
-    - name: Install M5Stack core
-      run: arduino-cli core install m5stack:esp32
-
-    - name: Install project libraries
-      run: |
-        # These are common libraries, adjust as needed
-        arduino-cli lib install "PubSubClient"
-        arduino-cli lib install "ArduinoJson"
-        arduino-cli lib install "M5Unified"
-        # WiFi and HTTPClient are usually part of the ESP32 core
-
-    - name: Generate secrets.h
-      env:
-        WIFI_SSID: ${{ secrets.WIFI_SSID }}
-        WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
-        MQTT_HOST: ${{ secrets.MQTT_HOST }}
-        MQTT_PORT: ${{ secrets.MQTT_PORT }}
-        MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
-        MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
-        TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_ENABLED }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        USE_STATIC_IP: ${{ secrets.USE_STATIC_IP }}
-        STATIC_IP_ADDRESS_OCTETS: ${{ secrets.STATIC_IP_ADDRESS_OCTETS }}
-        STATIC_GATEWAY_OCTETS: ${{ secrets.STATIC_GATEWAY_OCTETS }}
-        STATIC_SUBNET_OCTETS: ${{ secrets.STATIC_SUBNET_OCTETS }}
-        STATIC_DNS_OCTETS: ${{ secrets.STATIC_DNS_OCTETS }}
-      run: |
-        cat firmware/secrets.h.ci | 
-        sed "s|\${{ secrets.WIFI_SSID }}|"$WIFI_SSID"|g" | 
-        sed "s|\${{ secrets.WIFI_PASSWORD }}|"$WIFI_PASSWORD"|g" | 
-        sed "s|\${{ secrets.MQTT_HOST }}|"$MQTT_HOST"|g" | 
-        sed "s|\${{ secrets.MQTT_PORT }}|$MQTT_PORT|g" | 
-        sed "s|\${{ secrets.MQTT_USERNAME }}|"$MQTT_USERNAME"|g" | 
-        sed "s|\${{ secrets.MQTT_PASSWORD }}|"$MQTT_PASSWORD"|g" | 
-        sed "s|\${{ secrets.TELEGRAM_ENABLED }}|$TELEGRAM_ENABLED|g" | 
-        sed "s|\${{ secrets.TELEGRAM_BOT_TOKEN }}|"$TELEGRAM_BOT_TOKEN"|g" | 
-        sed "s|\${{ secrets.TELEGRAM_CHAT_ID }}|"$TELEGRAM_CHAT_ID"|g" | 
-        sed "s|\${{ secrets.USE_STATIC_IP }}|$USE_STATIC_IP|g" | 
-        sed "s|\${{ secrets.STATIC_IP_ADDRESS_OCTETS }}|$STATIC_IP_ADDRESS_OCTETS|g" | 
-        sed "s|\${{ secrets.STATIC_GATEWAY_OCTETS }}|$STATIC_GATEWAY_OCTETS|g" | 
-        sed "s|\${{ secrets.STATIC_SUBNET_OCTETS }}|$STATIC_SUBNET_OCTETS|g" | 
-        sed "s|\${{ secrets.STATIC_DNS_OCTETS }}|$STATIC_DNS_OCTETS|g" 
-        > firmware/secrets.h
-
-    - name: Compile ESP32 sketch
-      run: arduino-cli compile --fqbn m5stack:esp32:m5stickcplus2 firmware
+        idf.py build \
+          -DCONFIG_WIFI_SSID="${{ secrets.WIFI_SSID }}" \
+          -DCONFIG_WIFI_PASSWORD="${{ secrets.WIFI_PASSWORD }}" \
+          -DCONFIG_MQTT_HOST="${{ secrets.MQTT_HOST }}" \
+          -DCONFIG_MQTT_PORT=${{ secrets.MQTT_PORT }} \
+          -DCONFIG_MQTT_USERNAME="${{ secrets.MQTT_USERNAME }}" \
+          -DCONFIG_MQTT_PASSWORD="${{ secrets.MQTT_PASSWORD }}" \
+          -DCONFIG_TELEGRAM_ENABLED=${{ secrets.TELEGRAM_ENABLED }} \
+          -DCONFIG_TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+          -DCONFIG_TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -DCONFIG_USE_STATIC_IP=${{ secrets.USE_STATIC_IP }} \
+          -DCONFIG_STATIC_IP_ADDRESS_OCTETS="${{ secrets.STATIC_IP_ADDRESS_OCTETS }}" \
+          -DCONFIG_STATIC_GATEWAY_OCTETS="${{ secrets.STATIC_GATEWAY_OCTETS }}" \
+          -DCONFIG_STATIC_SUBNET_OCTETS="${{ secrets.STATIC_SUBNET_OCTETS }}" \
+          -DCONFIG_STATIC_DNS_OCTETS="${{ secrets.STATIC_DNS_OCTETS }}"
