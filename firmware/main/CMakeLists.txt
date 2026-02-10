@@ -1,6 +1,6 @@
 idf_component_register(SRCS "door_sensor.cpp"
                     INCLUDE_DIRS "."
-                    REQUIRES "cjson" "esp_http_client" "driver" "mbedtls")
+                    REQUIRES "esp_http_client" "driver" "mbedtls")
 
 # Additional components for M5Unified functionality if they become ESP-IDF components
 # For now, we'll assume a more direct driver approach or that specific M5-related components
