@@ -1,4 +1,9 @@
 #include "esp_sntp.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
 #include "lwip/dns.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
@@ -11,46 +16,63 @@
 #include <esp_wifi.h>
 #include <math.h>
 #include <nvs_flash.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
+// Display
+#include "driver/spi_master.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_types.h"
 
-// For MQTT
-#include <mqtt_client.h>
-// For JSON
+// MQTT & HTTP
 #include <cJSON.h>
-// For HTTP Client (for Telegram)
 #include <esp_http_client.h>
+#include <mqtt_client.h>
+
+#include "esp_cpu.h"
+#include "esp_pm.h"
+#include "soc/rtc_cntl_reg.h"
 
 static const char *TAG = "DOORSENSOR";
 
+// ------------------------- BUTTONS & PINS -------------------------
+#define BTN_A_PIN GPIO_NUM_37   // Front
+#define BTN_B_PIN GPIO_NUM_39   // Side (Calibration)
+#define LCD_BLK_PIN GPIO_NUM_27 // Backlight
+
 // ------------------------- MPU6886 Minimal Driver -------------------------
 #include <driver/i2c.h>
-
 #define I2C_MASTER_SDA_IO GPIO_NUM_21
 #define I2C_MASTER_SCL_IO GPIO_NUM_22
 #define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ 400000
-#define I2C_MASTER_TX_BUF_DISABLE 0
-#define I2C_MASTER_RX_BUF_DISABLE 0
 
 #define MPU6886_ADDR 0x68
-#define MPU6886_WHOAMI 0x75
-#define MPU6886_ACCEL_XOUT_H 0x3B
 #define MPU6886_PWR_MGMT_1 0x6B
-#define MPU6886_ACCEL_CONFIG 0x1C
-#define MPU6886_ACCEL_INTEL_CTRL 0x69
-#define MPU6886_INT_ENABLE 0x38
-
-// M5StickC Plus 2 Interrupt Pin
-#define IMU_INT_PIN GPIO_NUM_35
-#define IMU_INT_ACTIVE_LEVEL 0
+#define MPU6886_ACCEL_XOUT_H 0x3B
+#define MPU6886_PWR_MGMT_2 0x6C
 
 struct AccelData {
   float x, y, z;
 };
+
+// ------------------------- STATE VARIABLES (RTC) -------------------------
+constexpr uint64_t POLL_INTERVAL_US = 500000ULL; // 0.5s Poll
+
+// Stored in RTC Memory (survives Light Sleep)
+RTC_DATA_ATTR float rtcRefZ = 0.98f;     // Door Closed Reference
+RTC_DATA_ATTR float rtcRefX = 0.0f;      // Orientation Reference X
+RTC_DATA_ATTR float rtcRefY = 1.0f;      // Orientation Reference Y
+RTC_DATA_ATTR int rtcLastDoorState = -1; // 1: Closed, 0: Open
+RTC_DATA_ATTR uint32_t rtcBootCounter = 0;
+RTC_DATA_ATTR bool rtcArmed = true;            // Armed by default
+RTC_DATA_ATTR time_t rtcCalibrationTime = 0;   // Timestamp of last calibration
+RTC_DATA_ATTR bool rtcLowBattReported = false; // Prevent spamming low batt
+RTC_DATA_ATTR time_t rtcLastHeartbeat = 0;     // Heartbeat Timer
 
 esp_err_t mpu6886_write_byte(uint8_t reg, uint8_t data) {
   uint8_t write_buf[2] = {reg, data};
@@ -64,24 +86,10 @@ esp_err_t mpu6886_read_bytes(uint8_t reg, uint8_t *data, size_t len) {
 }
 
 esp_err_t initMPU6886() {
-  uint8_t id;
-  if (mpu6886_read_bytes(MPU6886_WHOAMI, &id, 1) != ESP_OK || id != 0x19) {
-    ESP_LOGE(TAG, "MPU6886 not found (ID: 0x%02X)", id);
-    return ESP_FAIL;
-  }
-
-  mpu6886_write_byte(MPU6886_PWR_MGMT_1,
-                     0x01); // Wake up, use clock auto-select
+  mpu6886_write_byte(MPU6886_PWR_MGMT_1, 0x01);
   vTaskDelay(pdMS_TO_TICKS(10));
-  mpu6886_write_byte(MPU6886_ACCEL_CONFIG, 0x10); // +/- 8g range
-
-  // Configure Wake-on-Motion (WOM) for deep sleep wakeup
-  // 1. Cycle bit for low power
-  // 2. Enable WOM logic
-  // 3. Set threshold (roughly 0.1g - 0.5g depending on noise)
-  // For now, keeping it simple; the core goal is functional orientation check.
-
-  ESP_LOGI(TAG, "MPU6886 initialized (ID: 0x%02X)", id);
+  mpu6886_write_byte(0x1C, 0x10);               // Accel Config 8G
+  mpu6886_write_byte(MPU6886_PWR_MGMT_2, 0x07); // Disable Gyro
   return ESP_OK;
 }
 
@@ -92,7 +100,6 @@ AccelData mpu6886_get_accel() {
     int16_t x = (int16_t)((buf[0] << 8) | buf[1]);
     int16_t y = (int16_t)((buf[2] << 8) | buf[3]);
     int16_t z = (int16_t)((buf[4] << 8) | buf[5]);
-    // Scale for 8g range (4096 LSB/g)
     data.x = (float)x / 4096.0f;
     data.y = (float)y / 4096.0f;
     data.z = (float)z / 4096.0f;
@@ -100,65 +107,309 @@ AccelData mpu6886_get_accel() {
   return data;
 }
 
-// ------------------------- Battery ADC Logic -------------------------
-#include "driver/adc.h"
-#include "esp_adc_cal.h"
+// ------------------------- DISPLAY DRIVER (ST7789) -------------------------
+esp_lcd_panel_handle_t panel_handle = NULL;
 
-#define BATTERY_ADC_CHANNEL ADC1_CHANNEL_2 // GPIO38 is ADC1_CHANNEL_2
-#define BATTERY_ADC_ATTEN ADC_ATTEN_DB_12
-#define BATTERY_ADC_WIDTH ADC_WIDTH_BIT_12
-#define BATTERY_VOLTAGE_DIVIDER_FACTOR 2.0
-static esp_adc_cal_characteristics_t adc_chars;
+void initDisplay() {
+  spi_bus_config_t buscfg = {};
+  buscfg.sclk_io_num = GPIO_NUM_13;
+  buscfg.mosi_io_num = GPIO_NUM_15;
+  buscfg.miso_io_num = -1;
+  buscfg.quadwp_io_num = -1;
+  buscfg.quadhd_io_num = -1;
+  buscfg.max_transfer_sz = 240 * 135 * 2 + 8;
+  spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
+  esp_lcd_panel_io_handle_t io_handle = NULL;
+  esp_lcd_panel_io_spi_config_t io_config = {};
+  io_config.dc_gpio_num = GPIO_NUM_14;
+  io_config.cs_gpio_num = GPIO_NUM_5;
+  io_config.pclk_hz = 20 * 1000 * 1000;
+  io_config.lcd_cmd_bits = 8;
+  io_config.lcd_param_bits = 8;
+  io_config.spi_mode = 0;
+  io_config.trans_queue_depth = 10;
+  esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &io_handle);
+
+  esp_lcd_panel_dev_config_t panel_config = {};
+  panel_config.reset_gpio_num = GPIO_NUM_12;
+  panel_config.rgb_endian = LCD_RGB_ENDIAN_BGR;
+  panel_config.bits_per_pixel = 16;
+  esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle);
+
+  esp_lcd_panel_reset(panel_handle);
+  esp_lcd_panel_init(panel_handle);
+  esp_lcd_panel_invert_color(panel_handle, true);
+
+  // Set Orientation based on Calibration (rtcRefX/Y)
+  // FORCE LANDSCAPE (M5StickC Plus 2)
+  esp_lcd_panel_swap_xy(panel_handle, true);
+  esp_lcd_panel_mirror(panel_handle, true, false); // Mirror X to fix text
+  esp_lcd_panel_set_gap(panel_handle, 40, 52);     // Keep Gap (40, 52)
+
+  esp_lcd_panel_disp_on_off(panel_handle, true);
+
+  // Backlight
+  gpio_set_direction(LCD_BLK_PIN, GPIO_MODE_OUTPUT); // Backlight
+  gpio_set_level(LCD_BLK_PIN, 0);                    // OFF initially
+}
+
+void setBacklight(bool on) { gpio_set_level(LCD_BLK_PIN, on ? 1 : 0); }
+
+// Graphics Helpers
+void fillRect(int x, int y, int w, int h, uint16_t color) {
+  if (!panel_handle)
+    return;
+  // Clip constraints
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x >= 240 || y >= 135)
+    return;
+  if (x + w > 240)
+    w = 240 - x;
+  if (y + h > 135)
+    h = 135 - y;
+  if (w <= 0 || h <= 0)
+    return;
+
+  uint16_t *buffer = (uint16_t *)heap_caps_malloc(w * h * 2, MALLOC_CAP_DMA);
+  if (!buffer)
+    return;
+  for (int i = 0; i < w * h; i++)
+    buffer[i] = (color >> 8) | (color << 8);
+  esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + w, y + h, buffer);
+  free(buffer);
+}
+
+// Modern Color Helper
+// Minimal 5x7 Bitmap Font (ASCII 32-90) - Only uppercase needed
+const uint8_t font5x7[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, // space
+    0x00, 0x00, 0x5F, 0x00, 0x00, // !
+    0x00, 0x07, 0x00, 0x07, 0x00, // "
+    0x14, 0x7F, 0x14, 0x7F, 0x14, // #
+    0x24, 0x2A, 0x7F, 0x2A, 0x12, // $
+    0x23, 0x13, 0x08, 0x64, 0x62, // %
+    0x36, 0x49, 0x55, 0x22, 0x50, // &
+    0x00, 0x05, 0x03, 0x00, 0x00, // '
+    0x00, 0x1C, 0x22, 0x41, 0x00, // (
+    0x00, 0x41, 0x22, 0x1C, 0x00, // )
+    0x14, 0x08, 0x3E, 0x08, 0x14, // *
+    0x08, 0x08, 0x3E, 0x08, 0x08, // +
+    0x00, 0x50, 0x30, 0x00, 0x00, // ,
+    0x08, 0x08, 0x08, 0x08, 0x08, // -
+    0x00, 0x60, 0x60, 0x00, 0x00, // .
+    0x20, 0x10, 0x08, 0x04, 0x02, // /
+    0x3E, 0x51, 0x49, 0x45, 0x3E, // 0
+    0x00, 0x42, 0x7F, 0x40, 0x00, // 1
+    0x42, 0x61, 0x51, 0x49, 0x46, // 2
+    0x21, 0x41, 0x45, 0x4B, 0x31, // 3
+    0x18, 0x14, 0x12, 0x7F, 0x10, // 4
+    0x27, 0x45, 0x45, 0x45, 0x39, // 5
+    0x3C, 0x4A, 0x49, 0x49, 0x30, // 6
+    0x01, 0x71, 0x09, 0x05, 0x03, // 7
+    0x36, 0x49, 0x49, 0x49, 0x36, // 8
+    0x06, 0x49, 0x49, 0x29, 0x1E, // 9
+    0x00, 0x36, 0x36, 0x00, 0x00, // :
+    0x00, 0x56, 0x36, 0x00, 0x00, // ;
+    0x08, 0x14, 0x22, 0x41, 0x00, // <
+    0x14, 0x14, 0x14, 0x14, 0x14, // =
+    0x00, 0x41, 0x22, 0x14, 0x08, // >
+    0x02, 0x01, 0x51, 0x09, 0x06, // ?
+    0x32, 0x49, 0x79, 0x41, 0x3E, // @
+    0x7E, 0x11, 0x11, 0x11, 0x7E, // A
+    0x7F, 0x49, 0x49, 0x49, 0x36, // B
+    0x3E, 0x41, 0x41, 0x41, 0x22, // C
+    0x7F, 0x41, 0x41, 0x22, 0x1C, // D
+    0x7F, 0x49, 0x49, 0x49, 0x41, // E
+    0x7F, 0x09, 0x09, 0x09, 0x01, // F
+    0x3E, 0x41, 0x49, 0x49, 0x7A, // G
+    0x7F, 0x08, 0x08, 0x08, 0x7F, // H
+    0x00, 0x41, 0x7F, 0x41, 0x00, // I
+    0x20, 0x40, 0x41, 0x3F, 0x01, // J
+    0x7F, 0x08, 0x14, 0x22, 0x41, // K
+    0x7F, 0x40, 0x40, 0x40, 0x40, // L
+    0x7F, 0x02, 0x0C, 0x02, 0x7F, // M
+    0x7F, 0x04, 0x08, 0x10, 0x7F, // N
+    0x3E, 0x41, 0x41, 0x41, 0x3E, // O
+    0x7F, 0x09, 0x09, 0x09, 0x06, // P
+    0x3E, 0x41, 0x51, 0x21, 0x5E, // Q
+    0x7F, 0x09, 0x19, 0x29, 0x46, // R
+    0x46, 0x49, 0x49, 0x49, 0x31, // S
+    0x01, 0x01, 0x7F, 0x01, 0x01, // T
+    0x3F, 0x40, 0x40, 0x40, 0x3F, // U
+    0x1F, 0x20, 0x40, 0x20, 0x1F, // V
+    0x3F, 0x40, 0x38, 0x40, 0x3F, // W
+    0x63, 0x14, 0x08, 0x14, 0x63, // X
+    0x07, 0x08, 0x70, 0x08, 0x07, // Y
+    0x61, 0x51, 0x49, 0x45, 0x43  // Z
+};
+
+void drawChar(int x, int y, char c, uint16_t color, int size) {
+  if (c < 32 || c > 90)
+    c = 32;
+  const uint8_t *glyph = &font5x7[(c - 32) * 5];
+  for (int i = 0; i < 5; i++) {
+    uint8_t line = glyph[i];
+    for (int j = 0; j < 7; j++) {
+      if (line & 1)
+        fillRect(x + i * size, y + j * size, size, size, color);
+      line >>= 1;
+    }
+  }
+}
+
+void drawString(int x, int y, const char *str, uint16_t color, int size) {
+  while (*str) {
+    drawChar(x, y, *str++, color, size);
+    x += 6 * size;
+  }
+}
+
+void drawUI(bool closed, uint32_t battMv, uint32_t ticks) {
+  // 1. Background
+  fillRect(0, 0, 240, 135, 0x0000);
+  // Debug Border
+  uint16_t bC = 0xF800;
+  fillRect(0, 0, 240, 1, bC);
+  fillRect(0, 134, 240, 1, bC);
+  fillRect(0, 0, 1, 135, bC);
+  fillRect(239, 0, 1, 135, bC);
+
+  // 2. Main Status Text
+  const char *status = closed ? "CLOSED" : "OPEN";
+  uint16_t color = closed ? 0x07E0 : 0xF800; // Green / Red
+  if (!rtcArmed)
+    color = 0x8410; // Grey
+
+  // Centering Text: Width = char_count * 6 * size
+  int len = strlen(status);
+  int size = 5; // LARGE
+  int textParams = len * 6 * size;
+  drawString((240 - textParams) / 2, 40, status, color, size);
+
+  // 3. Armed State (Below)
+  const char *armedStr = rtcArmed ? "ARMED" : "DISARMED";
+  uint16_t armColor = rtcArmed ? 0x07FF : 0x8410; // Cyan / Grey
+  size = 2;                                       // Medium
+  len = strlen(armedStr);
+  textParams = len * 6 * size;
+  drawString((240 - textParams) / 2, 90, armedStr, armColor, size);
+
+  // 4. Battery (Bottom)
+  char battStr[16];
+  // Simple float extraction
+  int v_int = battMv / 1000;
+  int v_dec = (battMv % 1000) / 100; // 1 decimal place
+  int idx = 0;
+  battStr[idx++] = 'B';
+  battStr[idx++] = 'A';
+  battStr[idx++] = 'T';
+  battStr[idx++] = ':';
+  battStr[idx++] = v_int + '0';
+  battStr[idx++] = '.';
+  battStr[idx++] = v_dec + '0';
+  battStr[idx++] = 'V';
+  battStr[idx] = 0;
+
+  drawString(10, 115, battStr, 0xFFFF, 2);
+}
+
+void drawBootScreen() {
+  fillRect(0, 0, 240, 135, 0x0000); // Clear
+
+  // Draw "M" (White) - Shifted +5px to Center
+  uint16_t w = 0xFFFF;
+  fillRect(70, 40, 10, 40, w); // Left Leg
+  fillRect(80, 40, 10, 10, w);
+  fillRect(90, 50, 10, 10, w); // Middle
+  fillRect(100, 40, 10, 10, w);
+  fillRect(110, 40, 10, 40, w); // Right Leg
+
+  // Draw "5" (Red) - Shifted +5px to Center
+  uint16_t r = 0xF800;
+  fillRect(140, 40, 30, 8, r); // Top
+  fillRect(140, 48, 8, 12, r); // Down 1
+  fillRect(140, 60, 30, 8, r); // Mid
+  fillRect(162, 68, 8, 12, r); // Down 2
+  fillRect(140, 80, 30, 8, r); // Bot
+
+  // Loading Bar
+  fillRect(50, 105, 140, 6, 0x2104); // BG
+  for (int i = 0; i <= 140; i += 5) {
+    fillRect(50, 105, i, 6, 0x07E0); // Fill Green
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+  vTaskDelay(pdMS_TO_TICKS(200));
+}
+
+void fillScreen(uint16_t color) { fillRect(0, 0, 240, 135, color); }
+
+// ------------------------- Battery ADC -------------------------
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
+#define BATTERY_ADC_CHANNEL ADC_CHANNEL_2
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static adc_cali_handle_t adc1_cali_handle = NULL;
 
 void initADC() {
-  adc1_config_width(BATTERY_ADC_WIDTH);
-  adc1_config_channel_atten(BATTERY_ADC_CHANNEL, BATTERY_ADC_ATTEN);
-  esp_adc_cal_characterize(ADC_UNIT_1, BATTERY_ADC_ATTEN, BATTERY_ADC_WIDTH,
-                           1100, &adc_chars);
+  if (adc1_handle)
+    return;
+  adc_oneshot_unit_init_cfg_t init_config1 = {};
+  init_config1.unit_id = ADC_UNIT_1;
+  adc_oneshot_new_unit(&init_config1, &adc1_handle);
+  adc_oneshot_chan_cfg_t config = {};
+  config.bitwidth = ADC_BITWIDTH_12;
+  config.atten = ADC_ATTEN_DB_12;
+  adc_oneshot_config_channel(adc1_handle, BATTERY_ADC_CHANNEL, &config);
+  adc_cali_line_fitting_config_t cali_config = {};
+  cali_config.unit_id = ADC_UNIT_1;
+  cali_config.atten = ADC_ATTEN_DB_12;
+  cali_config.bitwidth = ADC_BITWIDTH_12;
+  adc_cali_create_scheme_line_fitting(&cali_config, &adc1_cali_handle);
 }
 
 uint32_t getBatteryVoltageMv() {
-  uint32_t raw = 0;
-  for (int i = 0; i < 64; i++)
-    raw += adc1_get_raw(BATTERY_ADC_CHANNEL);
-  raw /= 64;
-  return (uint32_t)(esp_adc_cal_raw_to_voltage(raw, &adc_chars) *
-                    BATTERY_VOLTAGE_DIVIDER_FACTOR);
+  if (!adc1_handle)
+    initADC();
+  int raw = 0;
+  for (int i = 0; i < 4; i++) {
+    int val;
+    adc_oneshot_read(adc1_handle, BATTERY_ADC_CHANNEL, &val);
+    raw += val;
+  }
+  raw /= 4;
+  int voltage = 0;
+  if (adc1_cali_handle)
+    adc_cali_raw_to_voltage(adc1_cali_handle, raw, &voltage);
+  else
+    voltage = raw * 3300 / 4095;
+  return (uint32_t)(voltage * 2.0);
 }
 
-// --------------------------- State & Config ------------------------------
-constexpr uint64_t HEARTBEAT_INTERVAL_US =
-    6ULL * 60ULL * 60ULL * 1000000ULL; // 6h
-
-RTC_DATA_ATTR int rtcLastDoorState = -1;
-RTC_DATA_ATTR uint32_t rtcBootCounter = 0;
-
-struct RuntimeContext {
-  bool doorClosed;
-  bool stateChanged;
-  bool tamperDetected;
-  esp_sleep_wakeup_cause_t wakeReason;
-  bool heartbeatWake;
-};
-
-// --------------------------- WiFi & MQTT ------------------------------
+// ------------------------- WiFi & Logic -------------------------
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     esp_wifi_connect();
-  } else if (event_base == WIFI_EVENT &&
-             event_id == WIFI_EVENT_STA_DISCONNECTED) {
+  else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+  else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-  }
 }
 
-esp_err_t connectWifi() {
+void initWifiSystem() {
   s_wifi_event_group = xEventGroupCreate();
   esp_netif_init();
   esp_event_loop_create_default();
@@ -169,30 +420,15 @@ esp_err_t connectWifi() {
                                       &wifi_event_handler, NULL, NULL);
   esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                       &wifi_event_handler, NULL, NULL);
-
-#if CONFIG_USE_STATIC_IP
-  esp_netif_dhcpc_stop(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
-  esp_netif_ip_info_t ip_info;
-  ip4addr_aton(CONFIG_STATIC_IP_ADDRESS, &ip_info.ip);
-  ip4addr_aton(CONFIG_STATIC_GATEWAY, &ip_info.gw);
-  ip4addr_aton(CONFIG_STATIC_SUBNET, &ip_info.netmask);
-  esp_netif_set_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"),
-                        &ip_info);
-#endif
-
   wifi_config_t wifi_config = {};
   strncpy((char *)wifi_config.sta.ssid, CONFIG_WIFI_SSID, 32);
   strncpy((char *)wifi_config.sta.password, CONFIG_WIFI_PASSWORD, 64);
   esp_wifi_set_mode(WIFI_MODE_STA);
   esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-  esp_wifi_start();
-
-  EventBits_t bits = xEventGroupWaitBits(
-      s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
-      pdMS_TO_TICKS(10000));
-  return (bits & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_FAIL;
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 }
 
+// ------------------------- ALERTING SYSTEM -------------------------
 void syncClock() {
   esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
   esp_sntp_setservername(0, "pool.ntp.org");
@@ -202,117 +438,262 @@ void syncClock() {
     vTaskDelay(pdMS_TO_TICKS(500));
 }
 
-// --------------------------- Application Logic ------------------------------
-bool readDoorClosedDebounced() {
-  float sum_z = 0;
-  for (int i = 0; i < 7; i++) {
-    sum_z += mpu6886_get_accel().z;
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-  float avg_z = sum_z / 7.0f;
-  ESP_LOGI(TAG, "Avg Z: %.2f", avg_z);
-  return (avg_z > 0.8f && avg_z < 1.2f); // Assuming vertical is 1G
-}
+void sendAlert(const char *eventStr) {
+  ESP_LOGI(TAG, "Attempting to send Alert: %s (Armed=%d)", eventStr, rtcArmed);
 
-void publishEvent(const RuntimeContext &ctx) {
-  if (connectWifi() != ESP_OK)
+  // If Disarmed and NOT a Low Battery alert, skip.
+  if (!rtcArmed && strcmp(eventStr, "BATTERY_LOW") != 0) {
+    ESP_LOGI(TAG, "Event Skipped (Disarmed)");
     return;
-  syncClock();
-
-  esp_mqtt_client_config_t mqtt_cfg = {};
-  mqtt_cfg.broker.address.uri = "mqtt://" CONFIG_MQTT_HOST;
-  mqtt_cfg.broker.address.port = CONFIG_MQTT_PORT;
-  mqtt_cfg.credentials.username = CONFIG_MQTT_USERNAME;
-  mqtt_cfg.credentials.authentication.password = CONFIG_MQTT_PASSWORD;
-  mqtt_cfg.credentials.client_id = CONFIG_MQTT_CLIENT_ID;
-
-  esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-  esp_mqtt_client_start(client);
-
-  // Simplistic wait for connection
-  vTaskDelay(pdMS_TO_TICKS(2000));
-
-  cJSON *root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "device", "m5stickc-plus2");
-  cJSON_AddNumberToObject(root, "battery_mv", getBatteryVoltageMv());
-  cJSON_AddNumberToObject(root, "boot_count", rtcBootCounter);
-
-  if (ctx.stateChanged) {
-    cJSON_AddStringToObject(root, "event", ctx.doorClosed ? "CLOSED" : "OPEN");
-    char *s = cJSON_PrintUnformatted(root);
-    esp_mqtt_client_publish(client, "door/state", s, 0, 1, 0);
-    free(s);
-  } else if (ctx.heartbeatWake) {
-    cJSON_AddStringToObject(root, "event", "HEARTBEAT");
-    char *s = cJSON_PrintUnformatted(root);
-    esp_mqtt_client_publish(client, "door/heartbeat", s, 0, 0, 0);
-    free(s);
   }
 
-  // Telegram
-#if CONFIG_TELEGRAM_ENABLED
-  char url[256];
-  snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage",
-           CONFIG_TELEGRAM_BOT_TOKEN);
-  cJSON *tel = cJSON_CreateObject();
-  cJSON_AddStringToObject(tel, "chat_id", CONFIG_TELEGRAM_CHAT_ID);
-  char msg[64];
-  snprintf(msg, sizeof(msg), "Door Sensor: %s",
-           ctx.doorClosed ? "CLOSED" : "OPEN");
-  cJSON_AddStringToObject(tel, "text", msg);
-  char *post_data = cJSON_PrintUnformatted(tel);
+  xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+  esp_wifi_start();
+  if (xEventGroupWaitBits(s_wifi_event_group,
+                          WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
+                          pdMS_TO_TICKS(10000)) &
+      WIFI_CONNECTED_BIT) {
+    syncClock(); // Ensure time is correct for logs
 
-  esp_http_client_config_t http_cfg = {};
-  http_cfg.url = url;
-  http_cfg.method = HTTP_METHOD_POST;
-  esp_http_client_handle_t hc = esp_http_client_init(&http_cfg);
-  esp_http_client_set_header(hc, "Content-Type", "application/json");
-  esp_http_client_set_post_field(hc, post_data, strlen(post_data));
-  esp_http_client_perform(hc);
-  esp_http_client_cleanup(hc);
-  cJSON_Delete(tel);
-  free(post_data);
+    // MQTT
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = "mqtt://" CONFIG_MQTT_HOST;
+    mqtt_cfg.broker.address.port = CONFIG_MQTT_PORT;
+    mqtt_cfg.credentials.username = CONFIG_MQTT_USERNAME;
+    mqtt_cfg.credentials.authentication.password = CONFIG_MQTT_PASSWORD;
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_start(client);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    // Format Time
+    char timeStr[32] = "N/A";
+    if (rtcCalibrationTime > 0) {
+      struct tm timeinfo;
+      localtime_r(&rtcCalibrationTime, &timeinfo);
+      strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    }
+
+    char payload[200];
+    snprintf(payload, sizeof(payload),
+             "{\"event\": \"%s\", \"battery\": %ld, \"calibrated_at\": \"%s\", "
+             "\"boot_count\": %lu}",
+             eventStr, getBatteryVoltageMv(), timeStr, rtcBootCounter);
+
+    esp_mqtt_client_publish(client, "door/state", payload, 0, 1, 0);
+
+// Telegram
+#if CONFIG_TELEGRAM_ENABLED
+    char url[256];
+    char msg[128];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage",
+             CONFIG_TELEGRAM_BOT_TOKEN);
+    snprintf(msg, sizeof(msg), "Alert: %s\nBatt: %ldmV\nCalibrated: %s",
+             eventStr, getBatteryVoltageMv(), timeStr);
+
+    // JSON Escape (Simple) - in production use cJSON
+    char post_data[512];
+    snprintf(post_data, sizeof(post_data),
+             "{\"chat_id\": \"%s\", \"text\": \"%s\"}", CONFIG_TELEGRAM_CHAT_ID,
+             msg);
+
+    esp_http_client_config_t http_cfg = {};
+    http_cfg.url = url;
+    http_cfg.method = HTTP_METHOD_POST;
+    esp_http_client_handle_t hc = esp_http_client_init(&http_cfg);
+    esp_http_client_set_header(hc, "Content-Type", "application/json");
+    esp_http_client_set_post_field(hc, post_data, strlen(post_data));
+    esp_http_client_perform(hc);
+    esp_http_client_cleanup(hc);
 #endif
 
-  vTaskDelay(pdMS_TO_TICKS(1000));
-  esp_mqtt_client_destroy(client);
-  cJSON_Delete(root);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_mqtt_client_destroy(client);
+  }
+  esp_wifi_stop();
 }
 
-extern "C" void app_main() {
-  nvs_flash_init();
+// ------------------------- DISPLAY HELPERS -------------------------
+void wakeDisplay() {
+  if (panel_handle) {
+    esp_lcd_panel_disp_on_off(panel_handle, true);
+    vTaskDelay(pdMS_TO_TICKS(10)); // Allow TCON to wake
+    setBacklight(true);
+  }
+}
 
-  // I2C Init
+void sleepDisplay() {
+  if (panel_handle) {
+    setBacklight(false);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_lcd_panel_disp_on_off(panel_handle, false); // ST7789 Sleep
+  }
+}
+
+// [Duplicate RTC Vars Removed]
+extern "C" void app_main() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  gpio_reset_pin(GPIO_NUM_4);
+  gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_4, 1);
+  gpio_hold_en(GPIO_NUM_4);
+
+  // Initialize NVS (Critical for WiFi)
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    nvs_flash_init();
+  }
+
+  // Buttons Config
+  // Note: GPIO 37/39 are Input-Only and have NO internal pullups/downs.
+  // M5StickC Plus 2 has external 10k pullups.
+  gpio_config_t btn_conf = {};
+  btn_conf.pin_bit_mask = (1ULL << BTN_A_PIN) | (1ULL << BTN_B_PIN);
+  btn_conf.mode = GPIO_MODE_INPUT;
+  btn_conf.pull_up_en = GPIO_PULLUP_DISABLE; // External Pullups used
+  btn_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  gpio_config(&btn_conf);
+
+  initADC();
+  initWifiSystem();
+
   i2c_config_t conf = {};
   conf.mode = I2C_MODE_MASTER;
   conf.sda_io_num = I2C_MASTER_SDA_IO;
   conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
   conf.scl_io_num = I2C_MASTER_SCL_IO;
   conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-  conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
+  conf.master.clk_speed = 400000;
   i2c_param_config(I2C_MASTER_NUM, &conf);
   i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-
   initMPU6886();
-  initADC();
-  rtcBootCounter++;
 
-  RuntimeContext ctx{};
-  ctx.wakeReason = esp_sleep_get_wakeup_cause();
-  ctx.heartbeatWake = (ctx.wakeReason == ESP_SLEEP_WAKEUP_TIMER);
+  initDisplay();
+  // Fix Offset for M5StickC Plus 2 (135x240) handled in initDisplay
 
-  bool closed = readDoorClosedDebounced();
-  ctx.doorClosed = closed;
-  ctx.stateChanged =
-      (rtcLastDoorState < 0) || (static_cast<int>(closed) != rtcLastDoorState);
-  rtcLastDoorState = static_cast<int>(closed);
+  // BOOT SCREEN
+  esp_lcd_panel_disp_on_off(panel_handle, true);
+  setBacklight(true);
+  drawBootScreen();
 
-  if (ctx.stateChanged || ctx.heartbeatWake) {
-    publishEvent(ctx);
+  sleepDisplay();
+
+  ESP_LOGI(TAG, "System Start. RefZ=%.2f", rtcRefZ);
+
+  // Boot Check
+  AccelData acc = mpu6886_get_accel();
+  int initial_state = (fabs((double)acc.z - (double)rtcRefZ) < 0.2f) ? 1 : 0;
+  rtcLastDoorState = initial_state;
+
+  // Power & Sleep Config
+  esp_pm_config_t pm_config = {
+      .max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = true};
+  esp_pm_configure(&pm_config);
+
+  gpio_wakeup_enable(BTN_A_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  // Update Heartbeat on Boot if 0
+  time_t now;
+  time(&now);
+  if (rtcLastHeartbeat == 0)
+    rtcLastHeartbeat = now;
+
+  while (1) {
+    esp_sleep_enable_timer_wakeup(POLL_INTERVAL_US);
+    esp_sleep_enable_gpio_wakeup();
+    esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+      // 1. Check Door
+      acc = mpu6886_get_accel();
+      bool closed =
+          (fabs((double)acc.z - (double)rtcRefZ) < 0.2f); // Cast for safety
+      int state = closed ? 1 : 0;
+      if (state != rtcLastDoorState) {
+        rtcLastDoorState = state;
+        sendAlert(closed ? "CLOSED" : "OPEN");
+      }
+
+      // 2. Check Battery
+      uint32_t batt = getBatteryVoltageMv();
+      if (batt < 3550 && !rtcLowBattReported) {
+        sendAlert("BATTERY_LOW");
+        rtcLowBattReported = true;
+      } else if (batt > 3650) {
+        rtcLowBattReported = false;
+      }
+
+      // 3. Check Heartbeat (Every 24h = 86400s)
+      // We use simple counter estimation if time() isn't reliable in light
+      // sleep without SNTP But ESP32 RTC maintains time.
+      time(&now);
+      if (difftime(now, rtcLastHeartbeat) > 86400) {
+        sendAlert("HEARTBEAT");
+        rtcLastHeartbeat = now;
+      }
+    } else if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+      wakeDisplay();
+      while (gpio_get_level(BTN_A_PIN) == 0)
+        vTaskDelay(pdMS_TO_TICKS(10));
+      vTaskDelay(pdMS_TO_TICKS(100));
+
+      uint32_t last_interaction = xTaskGetTickCount();
+      bool display_active = true;
+
+      while (display_active) {
+        if (gpio_get_level(BTN_A_PIN) == 0) {
+          uint32_t press_start = xTaskGetTickCount();
+          while (gpio_get_level(BTN_A_PIN) == 0)
+            vTaskDelay(10);
+          if ((xTaskGetTickCount() - press_start) > pdMS_TO_TICKS(1000)) {
+            rtcArmed = !rtcArmed;
+            fillScreen(0xFFFF);
+            vTaskDelay(pdMS_TO_TICKS(200));
+          } else {
+            display_active = false;
+            break;
+          }
+        }
+        if (gpio_get_level(BTN_B_PIN) == 0) {
+          last_interaction = xTaskGetTickCount();
+          vTaskDelay(pdMS_TO_TICKS(2000));
+          if (gpio_get_level(BTN_B_PIN) == 0) {
+            AccelData c = mpu6886_get_accel();
+            rtcRefZ = c.z;
+            rtcRefX = c.x;
+            rtcRefY = c.y;
+            time(&rtcCalibrationTime); // Update Timestamp
+            fillScreen(0xFFFF);
+            vTaskDelay(pdMS_TO_TICKS(500));
+          }
+        }
+
+        bool closed = (fabs(mpu6886_get_accel().z - rtcRefZ) < 0.2f);
+
+        // Optimize: Update UI only if state changed OR 1s passed
+        static int last_ui_state = -1;
+        static uint32_t last_ui_time = 0;
+        uint32_t now = xTaskGetTickCount();
+        int current_state = (closed ? 1 : 0) | (rtcArmed ? 2 : 0);
+
+        if (current_state != last_ui_state ||
+            (now - last_ui_time) > pdMS_TO_TICKS(1000)) {
+          drawUI(closed, getBatteryVoltageMv(), now);
+          last_ui_state = current_state;
+          last_ui_time = now;
+        }
+
+        if ((xTaskGetTickCount() - last_interaction) > pdMS_TO_TICKS(30000))
+          display_active = false;
+        vTaskDelay(pdMS_TO_TICKS(100)); // Poll buttons faster (100ms)
+      }
+      sleepDisplay();
+      while (gpio_get_level(BTN_A_PIN) == 0)
+        vTaskDelay(10);
+    }
   }
-
-  esp_sleep_enable_timer_wakeup(HEARTBEAT_INTERVAL_US);
-  esp_sleep_enable_ext0_wakeup(IMU_INT_PIN, IMU_INT_ACTIVE_LEVEL);
-  ESP_LOGI(TAG, "Sleeping...");
-  esp_deep_sleep_start();
 }

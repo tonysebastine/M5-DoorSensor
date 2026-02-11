@@ -1,114 +1,69 @@
-# M5Stack Cplus2 Low-Power Door Sensor
+# M5StickC Plus 2 - Smart Door Sensor
 
-Production-oriented firmware and deployment assets for an **M5Stack Cplus2** door sensor with:
+A high-performance codebase that transforms the **M5StickC Plus 2** into a smart, power-efficient Door Sensor.
 
-- **Inbuilt sensor-based door state detection** (e.g., accelerometer, magnetometer)
-- MQTT event publishing for PC integrations (Node-RED/Mosquitto)
-- Optional Telegram alerting (direct from device)
-- Deep-sleep-first lifecycle for optimal battery operation
-
-## Repository Contents
-
-- `firmware/main/door_sensor.cpp` — Main firmware (ESP-IDF)
-- `nodered/door_sensor_flow.json` — Importable Node-RED flow for MQTT -> Telegram
-- `docs/android-app-selection.md` — Android application options and recommendations
-- `docs/test-validation-checklist.md` — Validation checklist and test procedure
-
----
-
-## 1) Hardware Setup
-
-### Mandatory hardware
-
-- M5Stack Cplus2
-
-### Wiring
-
-- No external wiring required for door state detection, uses inbuilt sensors.
+## 🚀 Features
+*   **Instant Alerts:** Detects door opening in **0.5 seconds**. Sends alerts via **MQTT** and **Telegram**.
+*   **10+ Hour Battery:** Uses smart `Light Sleep` to last ~20-30 hours on a single charge.
+*   **Modern UI:**
+    *   **Green Box:** Door Closed.
+    *   **Red Box:** Door Open.
+    *   **Grey Box:** Disarmed (Silent).
+    *   **Battery Bar:** Dynamic Green/Yellow/Red indicator at the bottom.
+*   **Auto-Orientation:** The display automatically rotates to "Up" based on how you mount it.
+*   **Arm/Disarm:** Toggle alerts on/off directly from the device.
 
 ---
 
-## 2) Firmware Build/Flash (ESP-IDF)
+## 🎮 Controls & Usage
 
-1. Ensure you have the ESP-IDF development environment set up.
-2. Navigate to the `firmware/` directory.
-3. Configure the project: `idf.py menuconfig` (set Wi-Fi, MQTT, and other configurations)
-4. Build the project: `idf.py build`
-5. Flash the firmware: `idf.py -p /dev/ttyUSB0 flash` (replace `/dev/ttyUSB0` with your serial port)
+### 1. **Wake Screen / Check Status**
+*   **Press Button A (Front):** Turns the screen **ON**.
+*   **Press Button A again:** Turns the screen **OFF**.
+*   (Auto-off after 30 seconds).
+
+### 2. **Arm / Disarm (Silent Mode)**
+*   Wake the screen.
+*   **Hold Button A (Front) for 1 second.**
+*   The screen will flash **White**.
+*   **Grey Box** = Disarmed (No alerts will be sent).
+*   **Colored Box** = Armed (Alerts active).
+
+### 3. **Calibration (One-Time Setup)**
+*   Mount the device on your door using double-sided tape.
+*   Close the door.
+*   Wake the screen.
+*   **Hold Button B (Side) for 2 seconds.**
+*   The screen will flash **White**.
+*   **Done!** The sensor now knows this position is "Closed" and "Up".
 
 ---
 
-## 3) Runtime Behavior (Boot -> Sleep)
+## 🛠️ Configuration (Firmware)
 
-1. Device wakes from ESP32 EXT0 or timer
-2. CPU is lowered to 80 MHz; LCD stays off
-3. Inbuilt sensors are sampled/debounced to determine door state
-4. If state changed -> publish `OPEN`/`CLOSED` via MQTT
-5. Optional heartbeat on timer wake
-6. Wi-Fi is disconnected, then device returns to deep sleep
+### **WiFi & MQTT**
+Run `idf.py menuconfig` -> `M5-DoorSensor Configuration` to set:
+*   WiFi SSID & Password.
+*   MQTT Broker IP, Port, User, Password.
 
-The firmware dynamically sets EXT0 wake level (if applicable for inbuilt sensors) to minimize power consumption and ensure both OPEN and CLOSED transitions can wake across sleep cycles.
+### **Telegram Alerts**
+1.  Get your **Bot Token** from [@BotFather](https://t.me/BotFather).
+2.  Get your **Chat ID** from [@userinfobot](https://t.me/userinfobot).
+3.  Run `idf.py menuconfig` -> `M5-DoorSensor Configuration` -> Enable Telegram and paste keys.
 
 ---
 
-## 4) MQTT Topic Contract
+## 💻 PC Alert Script (Optional)
+If you want instant pop-ups on your Windows PC:
+1.  Install Python.
+2.  Install dependencies: `pip install paho-mqtt plyer`
+3.  Run the listener:
+    ```resh
+    python firmware/alert_listener.py
+    ```
 
-- `door/state` with event payload `OPEN` or `CLOSED`
-- `door/tamper` with event payload `FORCE_DETECTED` (if implemented with inbuilt IMU)
-- `door/heartbeat` (optional)
-
-Payload schema:
-
-```json
-{
-  "device": "m5stickc-plus2",
-  "event": "OPEN",
-  "timestamp": "ISO8601-or-uptime-fallback",
-  "battery_mv": 4012,
-  "wake_reason": "EXT0" // Or other wake reason
-}
+## ⚡ Flashing
+```resh
+idf.py build
+idf.py -p COM8 flash monitor
 ```
-
----
-
-## 5) Node-RED + Telegram (Recommended)
-
-1. Install Mosquitto broker on PC
-2. Install Node-RED
-3. Import `nodered/door_sensor_flow.json`
-4. Set broker host/credentials in MQTT config node
-5. Set Telegram bot token + chat id in function/telegram nodes
-6. Deploy flow
-
-This flow subscribes to:
-
-- `door/state`
-- `door/tamper`
-- `door/heartbeat`
-
-and forwards human-readable alerts to Telegram.
-
----
-
-## 6) Battery & Power Notes
-
-- Deep sleep is the default mode
-- Wi-Fi is enabled only during transmit window
-- Expected active window per event is typically under ~2 seconds in normal networks
-- Optional heartbeat interval can be changed to reduce background wakeups
-
-For best battery life:
-
-- Keep RSSI strong (reduces connect time)
-- Avoid very frequent heartbeat
-- Tune sensor sampling and thresholds for optimal detection and power usage
-
----
-
-## 7) Acceptance Validation
-
-Use `docs/test-validation-checklist.md` for end-to-end verification:
-
-- Door state reliability using inbuilt sensors
-- Deep sleep current / wake duty cycle
-- End-to-end notification latency

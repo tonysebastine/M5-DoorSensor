@@ -1,2 +1,13 @@
-firmware/secrets.h
+# ESP-IDF specific
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+
+# OS specific
 .DS_Store
+Thumbs.db
+
+# Secrets (legacy)
+firmware/secrets.h

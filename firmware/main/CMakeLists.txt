@@ -9,4 +9,6 @@ idf_component_register(SRCS "door_sensor.cpp"
                             json
                             driver
                             esp_adc
-                            esp_http_client)
+                            esp_http_client
+                            esp_lcd
+                            esp_pm)
