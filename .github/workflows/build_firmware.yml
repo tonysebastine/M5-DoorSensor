@@ -34,7 +34,7 @@ jobs:
         fi
         
         idf.py reconfigure
-        idf.py build -v \
+        idf.py build \
           -DCONFIG_WIFI_SSID="${{ secrets.WIFI_SSID }}" \
           -DCONFIG_WIFI_PASSWORD="${{ secrets.WIFI_PASSWORD }}" \
           -DCONFIG_MQTT_HOST="${{ secrets.MQTT_HOST }}" \
