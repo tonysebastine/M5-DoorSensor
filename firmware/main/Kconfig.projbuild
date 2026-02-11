@@ -1,0 +1,107 @@
+menu "M5-DoorSensor Configuration"
+
+    menu "WiFi Configuration"
+        config WIFI_SSID
+            string "WiFi SSID"
+            default ""
+            help
+                SSID of the WiFi network to connect to.
+
+        config WIFI_PASSWORD
+            string "WiFi Password"
+            default ""
+            help
+                Password of the WiFi network.
+    endmenu
+
+    menu "MQTT Configuration"
+        config MQTT_HOST
+            string "MQTT Broker Host"
+            default ""
+            help
+                Hostname or IP address of the MQTT broker.
+
+        config MQTT_PORT
+            int "MQTT Broker Port"
+            default 1883
+            help
+                Port number of the MQTT broker.
+
+        config MQTT_USERNAME
+            string "MQTT Username"
+            default ""
+            help
+                Username for MQTT authentication.
+
+        config MQTT_PASSWORD
+            string "MQTT Password"
+            default ""
+            help
+                Password for MQTT authentication.
+
+        config MQTT_CLIENT_ID
+            string "MQTT Client ID"
+            default "m5-door-sensor"
+            help
+                Client ID to use for MQTT connection.
+    endmenu
+
+    menu "Telegram Configuration"
+        config TELEGRAM_ENABLED
+            bool "Enable Telegram Alerts"
+            default n
+            help
+                Enable direct Telegram notifications from the device.
+
+        config TELEGRAM_BOT_TOKEN
+            string "Telegram Bot Token"
+            default ""
+            depends on TELEGRAM_ENABLED
+            help
+                Token for the Telegram bot.
+
+        config TELEGRAM_CHAT_ID
+            string "Telegram Chat ID"
+            default ""
+            depends on TELEGRAM_ENABLED
+            help
+                Chat ID to send messages to.
+    endmenu
+
+    menu "Static IP Configuration"
+        config USE_STATIC_IP
+            bool "Use Static IP"
+            default n
+            help
+                Enable static IP configuration.
+
+        config STATIC_IP_ADDRESS
+            string "Static IP Address"
+            default ""
+            depends on USE_STATIC_IP
+            help
+                Static IP address to assign.
+
+        config STATIC_GATEWAY
+            string "Gateway Address"
+            default ""
+            depends on USE_STATIC_IP
+            help
+                Gateway address.
+
+        config STATIC_SUBNET
+            string "Subnet Mask"
+            default "255.255.255.0"
+            depends on USE_STATIC_IP
+            help
+                Subnet mask.
+
+        config STATIC_DNS
+            string "DNS Server"
+            default "8.8.8.8"
+            depends on USE_STATIC_IP
+            help
+                DNS server address.
+    endmenu
+
+endmenu
