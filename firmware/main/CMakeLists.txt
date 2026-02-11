@@ -1,3 +1,4 @@
+# Added to trigger a new build
 idf_component_register(SRCS "door_sensor.cpp"
                     INCLUDE_DIRS "."
                     REQUIRES "esp_http_client" "mbedtls" "esp_wifi" "esp_event" "nvs_flash" "esp_netif" "lwip" "esp_adc" "esp_driver_gpio" "esp_driver_i2c")
