@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "m5_doorsensor",
-    "project_version":    "5a32b3a-dirty",
+    "project_version":    "3ff7d83-dirty",
     "project_path":       "C:/Users/tonys/OneDrive/Documents/GitHub/M5-DoorSensor/firmware",
     "idf_path":           "C:/Espressif/frameworks/esp-idf-v5.5.2-2",
     "build_dir":          "C:/Users/tonys/OneDrive/Documents/GitHub/M5-DoorSensor/firmware/build",
