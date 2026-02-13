@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "m5_doorsensor",
-    "project_version":    "3ff7d83-dirty",
+    "project_version":    "0af29ca-dirty",
     "project_path":       "C:/Users/tonys/OneDrive/Documents/GitHub/M5-DoorSensor/firmware",
     "idf_path":           "C:/Espressif/frameworks/esp-idf-v5.5.2-2",
     "build_dir":          "C:/Users/tonys/OneDrive/Documents/GitHub/M5-DoorSensor/firmware/build",
@@ -1221,7 +1221,7 @@
             "type": "LIBRARY",
             "lib": "__idf_main",
             "reqs": [],
-            "priv_reqs": [ "esp_wifi", "esp_event", "nvs_flash", "esp_netif", "mqtt", "json", "driver", "esp_adc", "esp_http_client", "esp_lcd", "esp_pm" ],
+            "priv_reqs": [ "esp_wifi", "esp_event", "nvs_flash", "esp_netif", "mqtt", "json", "driver", "esp_adc", "esp_http_client", "esp_lcd", "esp_pm", "esp_http_server" ],
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "C:/Users/tonys/OneDrive/Documents/GitHub/M5-DoorSensor/firmware/build/esp-idf/main/libmain.a",
@@ -2908,7 +2908,7 @@
             "dir": "C:/Users/tonys/OneDrive/Documents/GitHub/M5-DoorSensor/firmware/main",
             "lib": "__idf_main",
             "reqs": [],
-            "priv_reqs": [ "esp_wifi", "esp_event", "nvs_flash", "esp_netif", "mqtt", "json", "driver", "esp_adc", "esp_http_client", "esp_lcd", "esp_pm" ],
+            "priv_reqs": [ "esp_wifi", "esp_event", "nvs_flash", "esp_netif", "mqtt", "json", "driver", "esp_adc", "esp_http_client", "esp_lcd", "esp_pm", "esp_http_server" ],
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "include_dirs": [ "." ]

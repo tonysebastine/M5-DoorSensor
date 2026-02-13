@@ -3,15 +3,17 @@
 A high-performance codebase that transforms the **M5StickC Plus 2** into a smart, power-efficient Door Sensor.
 
 ## 🚀 Features
-*   **Instant Alerts:** Detects door opening in **0.5 seconds**. Sends alerts via **MQTT** and **Telegram**.
+*   **Instant Alerts:** Detects door opening in **0.2 seconds**. Sends alerts via **MQTT** and **Telegram**.
+*   **Smart Static IP:** Captures and saves your IP info, BSSID, and Channel on the first connection. Subsequent wake-ups are **<1 second** with Fast-Connect BSSID Pinning.
 *   **10+ Hour Battery:** Uses smart `Light Sleep` to last ~20-30 hours on a single charge.
 *   **Modern UI:**
     *   **Green Box:** Door Closed.
     *   **Red Box:** Door Open.
     *   **Grey Box:** Disarmed (Silent).
-    *   **Battery Bar:** Dynamic Green/Yellow/Red indicator at the bottom.
-*   **Auto-Orientation:** The display automatically rotates to "Up" based on how you mount it.
-*   **Arm/Disarm:** Toggle alerts on/off directly from the device.
+    *   **WiFi Status:** Shows `OK`, `FAIL`, or `ADDR...` with the **WiFi SSID** displayed at the bottom.
+*   **WiFi Configuration Portal:** Configure WiFi credentials without recompiling.
+*   **Auto-Orientation:** The display automatically rotates based on mounting position.
+*   **Arm/Disarm:** Toggle alerts directly from the device.
 
 ---
 
@@ -37,6 +39,19 @@ A high-performance codebase that transforms the **M5StickC Plus 2** into a smart
 *   The screen will flash **White**.
 *   **Done!** The sensor now knows this position is "Closed" and "Up".
 
+---
+ 
+## 📶 WiFi Configuration
+ 
+If you need to change the WiFi network or don't want to hardcode credentials:
+1.  Wake the screen with **Button A**.
+2.  **Hold Button B (Side) for 5 seconds.**
+3.  The screen will turn **Blue** and show "WIFI CONFIG MODE".
+4.  Connect your phone/PC to the WiFi network: `M5-DoorSensor-XXXX`.
+5.  Open `http://192.168.4.1` in your browser.
+6.  Enter your WiFi credentials and click **Save**.
+7.  The device will restart and connect to the new network.
+ 
 ---
 
 ## 🛠️ Configuration (Firmware)

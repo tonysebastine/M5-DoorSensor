@@ -11,4 +11,5 @@ idf_component_register(SRCS "door_sensor.cpp"
                             esp_adc
                             esp_http_client
                             esp_lcd
-                            esp_pm)
+                            esp_pm
+                            esp_http_server)

@@ -5,9 +5,9 @@ import winsound  # Windows Sound
 from plyer import notification  # Install with: pip install plyer paho-mqtt
 
 # CONFIGURATION
-MQTT_BROKER = "10.10.10.11"
+MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
-MQTT_TOPIC = "door/state"
+MQTT_TOPIC = "m5door/tony/state"
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
@@ -57,31 +57,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Connection Failed: {e}")
         print("Please check: 1. Broker is running. 2. IP is correct. 3. Firewall is open.")
-        
-        if event == "OPEN":
-            # 1. Beep Sound (Frequency 1000Hz, Duration 500ms)
-            winsound.Beep(1000, 500)
-            
-            # 2. Popup Notification
-            notification.notify(
-                title='DOOR ALERT!',
-                message=f'The Door has been OPENED!\nBattery: {battery}mV',
-                app_name='M5 Door Monitor',
-                timeout=10
-            )
-            
-    except Exception as e:
-        print(f"Error parsing message: {e}")
 
-if __name__ == "__main__":
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.on_message = on_message
-
-    try:
-        print(f"Connecting to {MQTT_BROKER}...")
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.loop_forever()
-    except Exception as e:
-        print(f"Connection Failed: {e}")
-        print("Ensure you have installed requirements: pip install plyer paho-mqtt")

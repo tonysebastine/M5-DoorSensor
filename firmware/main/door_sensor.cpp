@@ -1,41 +1,40 @@
-#include "esp_sntp.h"
 #include <math.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-#include "lwip/dns.h"
-#include "lwip/netdb.h"
-#include "lwip/sockets.h"
-#include "sdkconfig.h"
-#include <driver/gpio.h>
-#include <esp_event.h>
-#include <esp_log.h>
-#include <esp_sleep.h>
-#include <esp_system.h>
-#include <esp_wifi.h>
-#include <math.h>
-#include <nvs_flash.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
-// Display
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
+
+#include "esp_cpu.h"
+#include "esp_event.h"
+#include "esp_http_client.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
+#include "esp_sntp.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "mqtt_client.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
+
+#include "lwip/dns.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_types.h"
-
-// MQTT & HTTP
-#include <cJSON.h>
-#include <esp_http_client.h>
-#include <mqtt_client.h>
-
-#include "esp_cpu.h"
-#include "esp_pm.h"
 #include "soc/rtc_cntl_reg.h"
 
 static const char *TAG = "DOORSENSOR";
@@ -61,7 +60,8 @@ struct AccelData {
 };
 
 // ------------------------- STATE VARIABLES (RTC) -------------------------
-constexpr uint64_t POLL_INTERVAL_US = 500000ULL; // 0.5s Poll
+constexpr uint64_t POLL_INTERVAL_US =
+    200000ULL; // 0.2s Poll for Instant Response
 
 // Stored in RTC Memory (survives Light Sleep)
 RTC_DATA_ATTR float rtcRefZ = 0.98f;     // Door Closed Reference
@@ -73,6 +73,9 @@ RTC_DATA_ATTR bool rtcArmed = true;            // Armed by default
 RTC_DATA_ATTR time_t rtcCalibrationTime = 0;   // Timestamp of last calibration
 RTC_DATA_ATTR bool rtcLowBattReported = false; // Prevent spamming low batt
 RTC_DATA_ATTR time_t rtcLastHeartbeat = 0;     // Heartbeat Timer
+RTC_DATA_ATTR int rtcWifiLastStatus =
+    0; // 0: None, 1: Success, 2: Failed, 3: Connecting
+RTC_DATA_ATTR char rtcCurrentSSID[33] = ""; // Buffer for SSID
 
 esp_err_t mpu6886_write_byte(uint8_t reg, uint8_t data) {
   uint8_t write_buf[2] = {reg, data};
@@ -145,7 +148,9 @@ void initDisplay() {
   // FORCE LANDSCAPE (M5StickC Plus 2)
   esp_lcd_panel_swap_xy(panel_handle, true);
   esp_lcd_panel_mirror(panel_handle, true, false); // Mirror X to fix text
-  esp_lcd_panel_set_gap(panel_handle, 40, 52);     // Keep Gap (40, 52)
+  esp_lcd_panel_set_gap(
+      panel_handle, 40,
+      50); // Gap 50 - Moved UP (Total shift: -2px from original)
 
   esp_lcd_panel_disp_on_off(panel_handle, true);
 
@@ -273,52 +278,91 @@ void drawString(int x, int y, const char *str, uint16_t color, int size) {
 }
 
 void drawUI(bool closed, uint32_t battMv, uint32_t ticks) {
-  // 1. Background
-  fillRect(0, 0, 240, 135, 0x0000);
-  // Debug Border
-  uint16_t bC = 0xF800;
-  fillRect(0, 0, 240, 1, bC);
-  fillRect(0, 134, 240, 1, bC);
-  fillRect(0, 0, 1, 135, bC);
-  fillRect(239, 0, 1, 135, bC);
+  // 1. Premium Dark Background
+  uint16_t bgColor = 0x0841; // Deep Deep Blue/Grey
+  fillRect(0, 0, 240, 135, bgColor);
 
-  // 2. Main Status Text
+  // Corner Highlights (Cyber-Deck aesthetic)
+  uint16_t accent = 0x3186; // Muted blue accent
+  fillRect(0, 0, 15, 2, accent);
+  fillRect(0, 0, 2, 15, accent); // Top-Left
+  fillRect(225, 0, 15, 2, accent);
+  fillRect(238, 0, 2, 15, accent); // Top-Right
+  fillRect(0, 133, 15, 2, accent);
+  fillRect(0, 120, 2, 15, accent); // Bot-Left
+  fillRect(225, 133, 15, 2, accent);
+  fillRect(238, 120, 2, 15, accent); // Bot-Right
+
+  // 2. Main Hero Block (Status)
   const char *status = closed ? "CLOSED" : "OPEN";
-  uint16_t color = closed ? 0x07E0 : 0xF800; // Green / Red
-  if (!rtcArmed)
-    color = 0x8410; // Grey
+  uint16_t statusColor = closed ? 0x03E0 : 0x8800; // Muted green/red background
+  uint16_t textColor =
+      closed ? 0x07E0 : 0xF840; // Bright Emerald / Sunset Orange
 
-  // Centering Text: Width = char_count * 6 * size
+  if (!rtcArmed) {
+    statusColor = 0x2104; // Dark Steel
+    textColor = 0x8410;   // Slate
+  }
+
+  // Breathing Pulse (Faster/Larger when OPEN)
+  int pulseSpeed = closed ? 12 : 6;
+  int pulseMax = closed ? 5 : 10;
+  int pulse = (ticks / pulseSpeed) % pulseMax;
+
+  int blockHeight = 62 + pulse;
+  int blockY = (70 - blockHeight / 2);
+
+  // Glow Border for Hero
+  fillRect(38, blockY - 2, 164, blockHeight + 4, 0x0000); // Black shadow
+  fillRect(40, blockY, 160, blockHeight, statusColor);
+
+  // Status Text (Perfectly Centered)
   int len = strlen(status);
-  int size = 5; // LARGE
-  int textParams = len * 6 * size;
-  drawString((240 - textParams) / 2, 40, status, color, size);
+  int textWidth = len * 6 * 5;
+  int textHeight = 7 * 5; // Scale 5
+  int textX = (240 - textWidth) / 2;
+  int textY = blockY + (blockHeight - textHeight) / 2;
+  drawString(textX, textY, status, textColor, 5);
 
-  // 3. Armed State (Below)
-  const char *armedStr = rtcArmed ? "ARMED" : "DISARMED";
-  uint16_t armColor = rtcArmed ? 0x07FF : 0x8410; // Cyan / Grey
-  size = 2;                                       // Medium
-  len = strlen(armedStr);
-  textParams = len * 6 * size;
-  drawString((240 - textParams) / 2, 90, armedStr, armColor, size);
+  // 3. System Badge (Header)
+  const char *systemTag = rtcArmed ? "[ SYSTEM ACTIVE ]" : "[ SYSTEM STANDBY ]";
+  uint16_t tagColor = rtcArmed ? 0x07FF : 0x8410;
+  int tagWidth = strlen(systemTag) * 6;
+  drawString((240 - tagWidth) / 2, 10, systemTag, tagColor, 1);
 
-  // 4. Battery (Bottom)
+  // 4. Integrated Dashboard (Footer)
+  fillRect(0, 115, 240, 20, 0x0000); // Darker tray
+  fillRect(0, 114, 240, 1, accent);  // Top Divider
+
+  // Segments: [ BATTERY ] | [ SSID ] | [ WIFI STATUS ]
+
+  // Battery
   char battStr[16];
-  // Simple float extraction
-  int v_int = battMv / 1000;
-  int v_dec = (battMv % 1000) / 100; // 1 decimal place
-  int idx = 0;
-  battStr[idx++] = 'B';
-  battStr[idx++] = 'A';
-  battStr[idx++] = 'T';
-  battStr[idx++] = ':';
-  battStr[idx++] = v_int + '0';
-  battStr[idx++] = '.';
-  battStr[idx++] = v_dec + '0';
-  battStr[idx++] = 'V';
-  battStr[idx] = 0;
+  snprintf(battStr, sizeof(battStr), "%d.%dV", (int)battMv / 1000,
+           (int)(battMv % 1000) / 100);
+  drawString(8, 121, battStr, 0xFFFF, 1);
+  fillRect(45, 118, 1, 14, 0x2104); // Vertical Divider 1
 
-  drawString(10, 115, battStr, 0xFFFF, 2);
+  // SSID (Dynamic positioning)
+  if (strlen(rtcCurrentSSID) > 0) {
+    int sLen = (int)strlen(rtcCurrentSSID);
+    if (sLen > 18)
+      sLen = 18;
+    char ssidDisp[20];
+    strncpy(ssidDisp, rtcCurrentSSID, sLen);
+    ssidDisp[sLen] = 0;
+    int sw = sLen * 6;
+    drawString((240 - sw) / 2, 121, ssidDisp, 0x8410, 1);
+  }
+  fillRect(190, 118, 1, 14, 0x2104); // Vertical Divider 2
+
+  // WiFi Status Link
+  if (rtcWifiLastStatus == 1)
+    drawString(196, 121, "ONLINE", 0x07E0, 1);
+  else if (rtcWifiLastStatus == 2)
+    drawString(196, 121, "FAILED", 0xF800, 1);
+  else
+    drawString(196, 121, "WAIT..", 0xFFE0, 1);
 }
 
 void drawBootScreen() {
@@ -396,33 +440,300 @@ uint32_t getBatteryVoltageMv() {
 
 // ------------------------- WiFi & Logic -------------------------
 static EventGroupHandle_t s_wifi_event_group;
+static esp_netif_t *sta_netif = NULL; // Netif handle
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
+struct StaticIP {
+  esp_ip4_addr_t ip;
+  esp_ip4_addr_t gw;
+  esp_ip4_addr_t netmask;
+  uint8_t bssid[6];
+  uint8_t channel;
+  bool valid;
+};
+
+// ------------------------- WiFi helpers -------------------------
+esp_err_t load_static_ip_info(StaticIP *info) {
+  nvs_handle_t nvs;
+  if (nvs_open("storage", NVS_READONLY, &nvs) != ESP_OK)
+    return ESP_FAIL;
+  size_t size = sizeof(StaticIP);
+  esp_err_t err = nvs_get_blob(nvs, "static_ip_blob", info, &size);
+  nvs_close(nvs);
+  return err;
+}
+
+esp_err_t save_static_ip_info(StaticIP *info) {
+  nvs_handle_t nvs;
+  if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK)
+    return ESP_FAIL;
+  nvs_set_blob(nvs, "static_ip_blob", info, sizeof(StaticIP));
+  nvs_commit(nvs);
+  nvs_close(nvs);
+  return ESP_OK;
+}
+
+esp_err_t clear_static_ip() {
+  nvs_handle_t nvs;
+  if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK)
+    return ESP_FAIL;
+  nvs_erase_key(nvs, "static_ip_blob");
+  nvs_commit(nvs);
+  nvs_close(nvs);
+  return ESP_OK;
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    ESP_LOGI(TAG, "WiFi Started. Connecting...");
+    rtcWifiLastStatus = 3;
     esp_wifi_connect();
-  else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+    ESP_LOGI(TAG, "WiFi Connected to AP. Waiting for IP...");
+    rtcWifiLastStatus = 4;
+  } else if (event_base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    wifi_event_sta_disconnected_t *disconn =
+        (wifi_event_sta_disconnected_t *)event_data;
+    ESP_LOGW(TAG, "WiFi Disconnected. Reason: %d", disconn->reason);
+    rtcWifiLastStatus = 2;
+
+    // Aggressively clear learned IP/BSSID on failure to ensure next boot
+    // performs full scan/DHCP 201=NO_AP_FOUND, 202=AUTH_FAIL,
+    // 15=4WAY_HANDSHAKE_TIMEOUT, 204=HANDSHAKE_TIMEOUT
+    if (disconn->reason == 201 || disconn->reason == 202 ||
+        disconn->reason == 15 || disconn->reason == 204 ||
+        disconn->reason == WIFI_REASON_CONNECTION_FAIL) {
+      ESP_LOGE(TAG,
+               "Connection Failed (Reason %d). Clearing Static IP cache to "
+               "force fresh DHCP.",
+               disconn->reason);
+      clear_static_ip();
+    }
+
     xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-  else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    rtcWifiLastStatus = 1;
+
+    // Capture Static IP & BSSID - Always overwrite to ensure we have the latest
+    // correct info This allows the router to change our IP via DHCP reservation
+    // and we will respect it on next boot
+    wifi_ap_record_t ap_info;
+    esp_wifi_sta_get_ap_info(&ap_info);
+
+    StaticIP current = {};
+    current.ip = event->ip_info.ip;
+    current.gw = event->ip_info.gw;
+    current.netmask = event->ip_info.netmask;
+    memcpy(current.bssid, ap_info.bssid, 6);
+    current.channel = ap_info.primary;
+    current.valid = true;
+
+    save_static_ip_info(&current);
+    ESP_LOGI(TAG,
+             "Learned Fast-Connect Details Updated (IP: " IPSTR ", Ch: %d).",
+             IP2STR(&current.ip), current.channel);
+
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+  }
+}
+
+// ------------------------- NVS CREDENTIALS -------------------------
+esp_err_t save_wifi_credentials(const char *ssid, const char *pass) {
+  nvs_handle_t nvs;
+  if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK)
+    return ESP_FAIL;
+  nvs_set_str(nvs, "wifi_ssid", ssid);
+  nvs_set_str(nvs, "wifi_pass", pass);
+  nvs_commit(nvs);
+  nvs_close(nvs);
+  return ESP_OK;
+}
+
+esp_err_t load_wifi_credentials(char *ssid, char *pass) {
+  nvs_handle_t nvs;
+  if (nvs_open("storage", NVS_READONLY, &nvs) != ESP_OK)
+    return ESP_FAIL;
+  size_t s_len = 32, p_len = 64;
+  nvs_get_str(nvs, "wifi_ssid", ssid, &s_len);
+  nvs_get_str(nvs, "wifi_pass", pass, &p_len);
+  nvs_close(nvs);
+  return (strlen(ssid) > 0) ? ESP_OK : ESP_FAIL;
+}
+
+// ------------------------- WiFi CONFIG PORTAL -------------------------
+static httpd_handle_t server = NULL;
+
+static esp_err_t config_get_handler(httpd_req_t *req) {
+  const char *resp =
+      "<!DOCTYPE html><html><head>"
+      "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+      "<title>M5-DoorSensor Config</title>"
+      "<style>"
+      "body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; "
+      "background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); "
+      "color: #fff; display: flex; justify-content: center; align-items: "
+      "center; height: 100vh; margin: 0; }"
+      ".card { background: rgba(255, 255, 255, 0.05); backdrop-filter: "
+      "blur(10px); padding: 40px; border-radius: 20px; box-shadow: 0 8px 32px "
+      "0 rgba(0, 0, 0, 0.37); border: 1px solid rgba(255, 255, 255, 0.1); "
+      "width: 320px; text-align: center; }"
+      "h1 { margin-bottom: 30px; font-weight: 300; letter-spacing: 2px; "
+      "color: #00d2ff; }"
+      "input { width: calc(100% - 24px); padding: 12px; margin: 12px 0; "
+      "border: none; border-radius: 8px; background: rgba(255, 255, 255, "
+      "0.1); color: #fff; outline: none; transition: 0.3s; }"
+      "input:focus { background: rgba(255, 255, 255, 0.2); box-shadow: 0 0 "
+      "8px rgba(0, 210, 255, 0.5); }"
+      "input[type='submit'] { width: 100%; background: #00d2ff; color: "
+      "#1a1a2e; "
+      "font-weight: bold; cursor: pointer; margin-top: 20px; transition: 0.3s; "
+      "border: none; }"
+      "input[type='submit']:hover { background: #0095b3; transform: "
+      "translateY(-2px); }"
+      "p { font-size: 0.8em; color: rgba(255, 255, 255, 0.5); margin-top: "
+      "20px; }"
+      "</style></head><body>"
+      "<div class='card'>"
+      "<h1>SENSITIVE CFG</h1>"
+      "<form action='/save' method='POST'>"
+      "WiFi SSID<input type='text' name='s' placeholder='Network name' "
+      "required>"
+      "Password<input type='password' name='p' placeholder='WiFi password'>"
+      "<input type='submit' value='CONNECT DEVICE'>"
+      "</form>"
+      "<p>Device will restart after saving</p>"
+      "</div>"
+      "</body></html>";
+  httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+static esp_err_t save_post_handler(httpd_req_t *req) {
+  char buf[128] = {0};
+  int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (ret <= 0)
+    return ESP_FAIL;
+
+  char ssid[32] = {0}, pass[64] = {0};
+  // Simplistic parsing of s=xxx&p=yyy
+  char *s_ptr = strstr(buf, "s=");
+  char *p_ptr = strstr(buf, "&p=");
+  if (s_ptr && p_ptr) {
+    *p_ptr = '\0';
+    strncpy(ssid, s_ptr + 2, 31);
+    strncpy(pass, p_ptr + 3, 63);
+    // Decode basic url encoding (space only for simplicity)
+    for (int i = 0; ssid[i]; i++)
+      if (ssid[i] == '+')
+        ssid[i] = ' ';
+    for (int i = 0; pass[i]; i++)
+      if (pass[i] == '+')
+        pass[i] = ' ';
+
+    save_wifi_credentials(ssid, pass);
+    clear_static_ip(); // Clear static IP to trigger re-learn on new network
+    httpd_resp_send(req, "Saved! Device will restart.", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+  } else {
+    httpd_resp_send(req, "Error: Invalid Data", HTTPD_RESP_USE_STRLEN);
+  }
+  return ESP_OK;
+}
+
+void startConfigPortal() {
+  ESP_LOGI(TAG, "Starting Config Portal...");
+  // Unregister existing handlers using the global event handler unregister
+  esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                               &wifi_event_handler);
+  esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                               &wifi_event_handler);
+  esp_wifi_stop();
+
+  wifi_config_t ap_config = {};
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf((char *)ap_config.ap.ssid, 32, "M5-DoorSensor-%02X%02X", mac[4],
+           mac[5]);
+  ap_config.ap.channel = 1;
+  ap_config.ap.max_connection = 4;
+  ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+  strncpy((char *)ap_config.ap.password, "12345678", 64);
+
+  esp_wifi_set_mode(WIFI_MODE_AP);
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  esp_wifi_start();
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  if (httpd_start(&server, &config) == ESP_OK) {
+    httpd_uri_t uri_get = {.uri = "/",
+                           .method = HTTP_GET,
+                           .handler = config_get_handler,
+                           .user_ctx = NULL};
+    httpd_register_uri_handler(server, &uri_get);
+    httpd_uri_t uri_post = {.uri = "/save",
+                            .method = HTTP_POST,
+                            .handler = save_post_handler,
+                            .user_ctx = NULL};
+    httpd_register_uri_handler(server, &uri_post);
+  }
 }
 
 void initWifiSystem() {
   s_wifi_event_group = xEventGroupCreate();
   esp_netif_init();
   esp_event_loop_create_default();
-  esp_netif_create_default_wifi_sta();
+  sta_netif = esp_netif_create_default_wifi_sta();
+  esp_netif_create_default_wifi_ap(); // Added for config portal
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_wifi_init(&cfg);
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                       &wifi_event_handler, NULL, NULL);
   esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                       &wifi_event_handler, NULL, NULL);
+
+  // Apply Static IP if valid
+  StaticIP s_ip = {};
+  bool has_static = (load_static_ip_info(&s_ip) == ESP_OK && s_ip.valid);
+  if (has_static) {
+    esp_netif_dhcpc_stop(sta_netif);
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip = s_ip.ip;
+    ip_info.gw = s_ip.gw;
+    ip_info.netmask = s_ip.netmask;
+    esp_netif_set_ip_info(sta_netif, &ip_info);
+    ESP_LOGI(TAG, "Static IP Applied: " IPSTR, IP2STR(&s_ip.ip));
+  }
+
+  // Load Credentials
   wifi_config_t wifi_config = {};
-  strncpy((char *)wifi_config.sta.ssid, CONFIG_WIFI_SSID, 32);
-  strncpy((char *)wifi_config.sta.password, CONFIG_WIFI_PASSWORD, 64);
+  char saved_ssid[32] = {0}, saved_pass[64] = {0};
+  if (load_wifi_credentials(saved_ssid, saved_pass) == ESP_OK) {
+    strncpy((char *)wifi_config.sta.ssid, saved_ssid, 32);
+    strncpy((char *)wifi_config.sta.password, saved_pass, 64);
+    strncpy(rtcCurrentSSID, saved_ssid, 32); // Store for UI
+    ESP_LOGI(TAG, "Loaded WiFi from NVS: %s", saved_ssid);
+  } else {
+    strncpy((char *)wifi_config.sta.ssid, CONFIG_WIFI_SSID, 32);
+    strncpy((char *)wifi_config.sta.password, CONFIG_WIFI_PASSWORD, 64);
+    strncpy(rtcCurrentSSID, CONFIG_WIFI_SSID, 32); // Store for UI
+    ESP_LOGI(TAG, "Using Default WiFi from Kconfig");
+  }
+
+  // Fast Connect Config (Pinning BSSID/Channel)
+  if (has_static) {
+    wifi_config.sta.bssid_set = true;
+    memcpy(wifi_config.sta.bssid, s_ip.bssid, 6);
+    wifi_config.sta.channel = s_ip.channel;
+    wifi_config.sta.scan_method = WIFI_FAST_SCAN;
+    ESP_LOGI(TAG, "Fast-Connect Configured (BSSID Locked)");
+  }
+
   esp_wifi_set_mode(WIFI_MODE_STA);
   esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -447,13 +758,17 @@ void sendAlert(const char *eventStr) {
     return;
   }
 
+  rtcWifiLastStatus = 3; // Connecting... status
   xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
   esp_wifi_start();
+  esp_wifi_set_ps(WIFI_PS_NONE); // Force high performance
+
   if (xEventGroupWaitBits(s_wifi_event_group,
                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
-                          pdMS_TO_TICKS(10000)) &
+                          pdMS_TO_TICKS(12000)) & // Increased to 12s
       WIFI_CONNECTED_BIT) {
-    syncClock(); // Ensure time is correct for logs
+    rtcWifiLastStatus = 1; // Success
+    // Removed syncClock() here to save several seconds of latency
 
     // MQTT
     esp_mqtt_client_config_t mqtt_cfg = {};
@@ -461,11 +776,16 @@ void sendAlert(const char *eventStr) {
     mqtt_cfg.broker.address.port = CONFIG_MQTT_PORT;
     mqtt_cfg.credentials.username = CONFIG_MQTT_USERNAME;
     mqtt_cfg.credentials.authentication.password = CONFIG_MQTT_PASSWORD;
+    mqtt_cfg.session.keepalive = 10;
+
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_start(client);
-    vTaskDelay(pdMS_TO_TICKS(1500));
 
-    // Format Time
+    // Instead of waiting, we use a small polling check or just Fire & Forget
+    // In low-latency scenarios, we publish directly if connection is fast
+    vTaskDelay(pdMS_TO_TICKS(500)); // Reduced from 1500ms
+
+    // Format Time (RTC)
     char timeStr[32] = "N/A";
     if (rtcCalibrationTime > 0) {
       struct tm timeinfo;
@@ -479,7 +799,7 @@ void sendAlert(const char *eventStr) {
              "\"boot_count\": %lu}",
              eventStr, getBatteryVoltageMv(), timeStr, rtcBootCounter);
 
-    esp_mqtt_client_publish(client, "door/state", payload, 0, 1, 0);
+    esp_mqtt_client_publish(client, "m5door/tony/state", payload, 0, 1, 0);
 
 // Telegram
 #if CONFIG_TELEGRAM_ENABLED
@@ -508,6 +828,8 @@ void sendAlert(const char *eventStr) {
 
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_mqtt_client_destroy(client);
+  } else {
+    rtcWifiLastStatus = 2; // Failed
   }
   esp_wifi_stop();
 }
@@ -660,8 +982,35 @@ extern "C" void app_main() {
         }
         if (gpio_get_level(BTN_B_PIN) == 0) {
           last_interaction = xTaskGetTickCount();
-          vTaskDelay(pdMS_TO_TICKS(2000));
-          if (gpio_get_level(BTN_B_PIN) == 0) {
+          uint32_t b_press_start = xTaskGetTickCount();
+          bool long_long_press = false;
+          while (gpio_get_level(BTN_B_PIN) == 0) {
+            if ((xTaskGetTickCount() - b_press_start) > pdMS_TO_TICKS(5000)) {
+              long_long_press = true;
+              break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+          }
+
+          if (long_long_press) {
+            // Enter WiFi Config Mode
+            fillRect(0, 0, 240, 135, 0x001F); // Blue Screen
+            drawString(20, 20, "WIFI CONFIG MODE", 0xFFFF, 2);
+            drawString(20, 50, "Connect to AP:", 0xFFFF, 1);
+
+            uint8_t mac[6];
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            char ap_name[32];
+            snprintf(ap_name, 32, "M5-DoorSensor-%02X%02X", mac[4], mac[5]);
+            drawString(20, 70, ap_name, 0x07FF, 2);
+            drawString(20, 100, "IP: 192.168.4.1", 0xFFFF, 2);
+
+            startConfigPortal();
+            // Loop forever in config mode until restart
+            while (1)
+              vTaskDelay(pdMS_TO_TICKS(1000));
+          } else if ((xTaskGetTickCount() - b_press_start) >
+                     pdMS_TO_TICKS(1500)) {
             AccelData c = mpu6886_get_accel();
             rtcRefZ = c.z;
             rtcRefX = c.x;
